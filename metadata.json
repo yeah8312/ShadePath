@@ -1,0 +1,6 @@
+{
+  "name": "ShadePath",
+  "description": "실시간 태양 고도와 2D 지도 색상 분석을 활용하여 쾌적한 그늘길 보행 경로를 안내하는 지도 서비스",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
