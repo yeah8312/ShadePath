@@ -235,6 +235,115 @@ export function unionShadowUTM(footprint: any, translated: any, sideQuads: any[]
 }
 
 // Robust OpenRouteService call
+const asyncHandler = (fn: any) => (req: any, res: any, next: any) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+interface OverpassAttempt {
+  endpoint: string;
+  error?: string;
+  name?: string;
+  cause?: string;
+  causeCode?: string;
+  status?: number;
+  timeMs?: number;
+  bbox?: string;
+  queryLength?: number;
+}
+
+async function fetchFromOverpassWithRetry(query: string, bbox: string): Promise<{
+  data: any;
+  attempts: OverpassAttempt[];
+  successfulEndpoint: string;
+  latencyMs: number;
+}> {
+  const OVERPASS_ENDPOINTS = Array.from(new Set([
+    process.env.OVERPASS_API_URL,
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+  ].filter(Boolean))) as string[];
+
+  const attempts: OverpassAttempt[] = [];
+
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    const startTime = Date.now();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'ShadePath/1.0 (cksgma3218@gmail.com)',
+          'Accept': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+        },
+        body: new URLSearchParams({ data: query }).toString(),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+      const duration = Date.now() - startTime;
+
+      if (!response.ok) {
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          const errText = await response.text();
+          throw new Error(`QUERY_ERROR: HTTP ${response.status} - ${errText}`);
+        }
+        throw new Error(`HTTP_STATUS_${response.status}`);
+      }
+
+      const data = await response.json();
+      return {
+        data,
+        attempts,
+        successfulEndpoint: endpoint,
+        latencyMs: duration
+      };
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      const duration = Date.now() - startTime;
+
+      const attempt: OverpassAttempt = {
+        endpoint,
+        error: err.message || String(err),
+        name: err.name || 'Error',
+        cause: err.cause ? (err.cause.message || String(err.cause)) : undefined,
+        causeCode: err.cause?.code || err.code,
+        status: err.message?.startsWith('HTTP_STATUS_') ? parseInt(err.message.replace('HTTP_STATUS_', '')) : undefined,
+        timeMs: duration,
+        bbox,
+        queryLength: query.length
+      };
+
+      console.error('Overpass request attempt failed:', {
+        endpoint: attempt.endpoint,
+        message: attempt.error,
+        name: attempt.name,
+        cause: attempt.cause,
+        causeCode: attempt.causeCode,
+        status: attempt.status,
+        requestTimeMs: duration,
+        bbox,
+        queryLength: query.length
+      });
+
+      attempts.push(attempt);
+
+      if (err.message && err.message.startsWith('QUERY_ERROR')) {
+        const queryErr = new Error(err.message);
+        (queryErr as any).attempts = attempts;
+        throw queryErr;
+      }
+    }
+  }
+
+  const allFailedErr = new Error('ALL_ENDPOINTS_FAILED');
+  (allFailedErr as any).attempts = attempts;
+  throw allFailedErr;
+}
+
+// Robust OpenRouteService call
 async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat: number; lng: number }): Promise<any> {
   const ORS_API_KEY = process.env.ORS_API_KEY;
   if (!ORS_API_KEY) {
@@ -282,7 +391,7 @@ async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat
 }
 
 // --- Geocoding API Endpoints ---
-app.get('/api/geocode', async (req, res) => {
+app.get('/api/geocode', asyncHandler(async (req, res) => {
   const q = (req.query.q as string || '').trim();
   if (!q) {
     return res.status(400).json({ error: 'Search query is required' });
@@ -323,9 +432,9 @@ app.get('/api/geocode', async (req, res) => {
     console.error('Geocoding error:', err.message);
     return res.status(502).json({ error: '지오코딩 서비스를 사용할 수 없습니다.' });
   }
-});
+}));
 
-app.get('/api/reverse-geocode', async (req, res) => {
+app.get('/api/reverse-geocode', asyncHandler(async (req, res) => {
   const lat = parseFloat(req.query.lat as string);
   const lng = parseFloat(req.query.lng as string);
 
@@ -366,10 +475,10 @@ app.get('/api/reverse-geocode', async (req, res) => {
     console.error('Reverse geocoding error:', err.message);
     return res.status(502).json({ error: '역지오코딩 서비스를 사용할 수 없습니다.' });
   }
-});
+}));
 
 // --- Main Pedestrian Shade Route Endpoint ---
-app.post('/api/shade-route', async (req, res) => {
+app.post('/api/shade-route', asyncHandler(async (req, res) => {
   const { start, end, datetime, weatherCondition = 'sunny', shadeWeight = 50 } = req.body;
 
   if (!start || typeof start.lat !== 'number' || typeof start.lng !== 'number' ||
@@ -499,7 +608,7 @@ app.post('/api/shade-route', async (req, res) => {
 
   // 4. Fetch real OSM buildings using Overpass API
   let overpassData: any = null;
-  const OVERPASS_API_URL = process.env.OVERPASS_API_URL ?? 'https://overpass-api.de/api/interpreter';
+  let attempts: OverpassAttempt[] = [];
 
   try {
     const cached = overpassCache.get(bboxKey);
@@ -517,28 +626,18 @@ app.post('/api/shade-route', async (req, res) => {
         out body geom;
       `;
 
-      const response = await fetch(OVERPASS_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          'Accept': 'application/json'
-        },
-        body: new URLSearchParams({ data: overpassQuery })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Overpass returned status ${response.status}`);
-      }
-
-      overpassData = await response.json();
+      const result = await fetchFromOverpassWithRetry(overpassQuery, bboxKey);
+      overpassData = result.data;
+      attempts = result.attempts;
       overpassCache.set(bboxKey, { timestamp: Date.now(), data: overpassData });
     }
   } catch (err: any) {
     console.error('Overpass request failed:', err.message);
     return res.status(502).json({
       error: 'OVERPASS_UNAVAILABLE',
-      message: '실제 OSM 건물 데이터를 불러오지 못했습니다.',
-      buildingSource: 'none'
+      message: '모든 Overpass 서버에서 실제 OSM 건물 데이터를 불러오지 못했습니다.',
+      buildingSource: 'none',
+      attempts: err.attempts || attempts
     });
   }
 
@@ -591,18 +690,25 @@ app.post('/api/shade-route', async (req, res) => {
   const buildings = rawFeatures.filter(f => f.featureType === 'building');
   
   const filteredBuildings = buildings.filter(b => {
+    const buildingFeature = turf.feature(b.geometry);
     for (const p of parts) {
       try {
-        const overlap = turf.booleanOverlap(b as any, p as any) ||
-                        turf.booleanContains(b as any, p as any) ||
-                        turf.booleanContains(p as any, b as any);
+        const partFeature = turf.feature(p.geometry);
+        const overlap = turf.booleanOverlap(buildingFeature, partFeature) ||
+                        turf.booleanContains(buildingFeature, partFeature) ||
+                        turf.booleanContains(partFeature, buildingFeature);
         if (overlap) return false;
       } catch (e) {
         // Fallback bbox overlap
-        const bboxB = turf.bbox(b as any);
-        const bboxP = turf.bbox(p as any);
-        const bboxOverlap = !(bboxB[2] < bboxP[0] || bboxB[0] > bboxP[2] || bboxB[3] < bboxP[1] || bboxB[1] > bboxP[3]);
-        if (bboxOverlap) return false;
+        try {
+          const partFeature = turf.feature(p.geometry);
+          const bboxB = turf.bbox(buildingFeature);
+          const bboxP = turf.bbox(partFeature);
+          const bboxOverlap = !(bboxB[2] < bboxP[0] || bboxB[0] > bboxP[2] || bboxB[3] < bboxP[1] || bboxB[1] > bboxP[3]);
+          if (bboxOverlap) return false;
+        } catch (bboxErr) {
+          // Ignore deep failures per building pair so we don't crash
+        }
       }
     }
     return true;
@@ -787,8 +893,8 @@ app.post('/api/shade-route', async (req, res) => {
       heightSource: b.heightSource,
       heightConfidence: b.heightConfidence,
       name: b.name,
-      footprint: b.footprintWGS84?.coordinates?.[0]?.map((p: any) => [p[1], p[0]]) || [], // Convert [lng, lat] back to [lat, lng] for leaflet
-      shadows: b.shadowWGS84?.coordinates?.[0]?.map((p: any) => [p[1], p[0]]) ? [b.shadowWGS84.coordinates[0].map((p: any) => [p[1], p[0]])] : []
+      footprintGeometry: b.footprintWGS84,
+      shadowGeometry: b.shadowWGS84
     })),
     routingSource,
     buildingSource: "overpass",
@@ -797,6 +903,80 @@ app.post('/api/shade-route', async (req, res) => {
     degraded: routingSource !== "openrouteservice" || shadowCount === 0,
     warnings
   });
+}));
+
+// --- Diagnostic & Health Endpoints ---
+app.get('/api/health', (req, res) => {
+  const OVERPASS_ENDPOINTS = Array.from(new Set([
+    process.env.OVERPASS_API_URL,
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+  ].filter(Boolean))) as string[];
+
+  res.json({
+    ok: true,
+    service: "ShadePath",
+    timestamp: new Date().toISOString(),
+    orsConfigured: !!process.env.ORS_API_KEY,
+    overpassEndpoints: OVERPASS_ENDPOINTS
+  });
+});
+
+app.get('/api/health/overpass', asyncHandler(async (req, res) => {
+  const query = `[out:json][timeout:5];node(35.8714,128.6014,35.8715,128.6015);out;`;
+  const bbox = '35.8714,128.6014,35.8715,128.6015';
+
+  try {
+    const { attempts, successfulEndpoint, latencyMs } = await fetchFromOverpassWithRetry(query, bbox);
+    return res.json({
+      ok: true,
+      selectedEndpoint: successfulEndpoint,
+      latencyMs,
+      attempts
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      ok: false,
+      error: "ALL_ENDPOINTS_FAILED",
+      message: "Overpass health check failed on all endpoints.",
+      causeCode: err.cause?.code || err.code,
+      attempts: err.attempts || []
+    });
+  }
+}));
+
+// 404 handler for /api/*
+app.use('/api/*', (req, res, next) => {
+  res.status(404).json({
+    error: 'API_NOT_FOUND',
+    message: '요청하신 API 엔드포인트를 찾을 수 없습니다.',
+    requestId: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
+  });
+});
+
+// JSON error middleware for API
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.path.startsWith('/api/')) {
+    const requestId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const status = err.status || err.statusCode || 500;
+    
+    console.error(`API Error [Request ID: ${requestId}]:`, err);
+
+    const errorResponse: any = {
+      error: err.code || "INTERNAL_API_ERROR",
+      message: err.message || "서버 내부 오류가 발생했습니다.",
+      requestId
+    };
+
+    if (process.env.NODE_ENV !== 'production') {
+      errorResponse.stack = err.stack;
+      errorResponse.cause = err.cause ? (err.cause.message || String(err.cause)) : undefined;
+      errorResponse.causeCode = err.cause?.code || err.code;
+    }
+
+    return res.status(status).json(errorResponse);
+  }
+  next(err);
 });
 
 // Setup dev and production servers

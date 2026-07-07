@@ -24,12 +24,24 @@ interface MapContainerProps {
     featureType: 'building' | 'building:part';
     name: string;
     height: number;
-    footprint: [number, number][];
-    shadows: [number, number][][];
+    footprintGeometry?: any;
+    shadowGeometry?: any;
     heightSource: string;
     heightConfidence: string;
   }[];
   showDiagnostics?: boolean;
+}
+
+function getCentroidWGS84(geom: any): [number, number] | null {
+  if (!geom) return null;
+  if (geom.type === 'Polygon') {
+    const coord = geom.coordinates?.[0]?.[0];
+    if (coord) return [coord[1], coord[0]]; // [lat, lng]
+  } else if (geom.type === 'MultiPolygon') {
+    const coord = geom.coordinates?.[0]?.[0]?.[0];
+    if (coord) return [coord[1], coord[0]]; // [lat, lng]
+  }
+  return null;
 }
 
 export default function MapContainer({
@@ -55,6 +67,12 @@ export default function MapContainer({
   const pathLayersRef = useRef<L.LayerGroup | null>(null);
   const markerLayersRef = useRef<L.LayerGroup | null>(null);
   const diagnosticLayersRef = useRef<L.LayerGroup | null>(null);
+
+  // Store click callback in ref to prevent map destruction
+  const onMapClickRef = useRef(onMapClick);
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  }, [onMapClick]);
 
   // Initialize Map exactly once
   useEffect(() => {
@@ -91,7 +109,7 @@ export default function MapContainer({
 
     // Set destination on map click
     map.on('click', (e: L.LeafletMouseEvent) => {
-      onMapClick(e.latlng.lat, e.latlng.lng, 'end');
+      onMapClickRef.current(e.latlng.lat, e.latlng.lng, 'end');
     });
 
     return () => {
@@ -100,7 +118,7 @@ export default function MapContainer({
         mapInstanceRef.current = null;
       }
     };
-  }, [onMapClick]);
+  }, []);
 
   // Handle map center changes smoothly
   useEffect(() => {
@@ -127,38 +145,38 @@ export default function MapContainer({
     // 1. Render shadows
     if (showShadows && realBuildings) {
       realBuildings.forEach(b => {
-        if (!b.shadows) return;
-        b.shadows.forEach(shadowPoly => {
-          if (shadowPoly.length === 0) return;
-          L.polygon(shadowPoly, {
+        if (!b.shadowGeometry) return;
+        L.geoJSON(b.shadowGeometry, {
+          style: {
             stroke: false,
             fillColor: '#1e293b',
-            fillOpacity: 0.5,
-            interactive: false
-          }).addTo(shadowGroup);
-        });
+            fillOpacity: 0.5
+          },
+          interactive: false
+        }).addTo(shadowGroup);
       });
     }
 
     // 2. Render buildings
     if (showBuildings && realBuildings) {
       realBuildings.forEach(b => {
-        if (!b.footprint || b.footprint.length === 0) return;
+        if (!b.footprintGeometry) return;
         
         // Define building styling color based on feature type
         const strokeColor = b.featureType === 'building:part' ? '#6366f1' : '#475569';
         const fillColor = b.featureType === 'building:part' ? '#c7d2fe' : '#94a3b8';
 
-        const poly = L.polygon(b.footprint, {
-          color: strokeColor,
-          weight: 1,
-          fillColor: fillColor,
-          fillOpacity: 0.75,
-          interactive: true
+        const geojsonLayer = L.geoJSON(b.footprintGeometry, {
+          style: {
+            color: strokeColor,
+            weight: 1,
+            fillColor: fillColor,
+            fillOpacity: 0.75
+          }
         });
 
         // Detailed building popup with info
-        poly.bindPopup(`
+        geojsonLayer.bindPopup(`
           <div class="font-sans text-xs flex flex-col gap-1 p-1">
             <div class="font-bold text-gray-800 text-sm border-b pb-1 mb-1 flex items-center justify-between">
               <span>🏢 ${b.name || '건물'}</span>
@@ -171,12 +189,11 @@ export default function MapContainer({
           </div>
         `, { maxWidth: 220 });
 
-        poly.addTo(buildingGroup);
+        geojsonLayer.addTo(buildingGroup);
 
         // Render diagnostics text label if activated
         if (showDiagnostics) {
-          // Put height text at the centroid/first point
-          const centerPt = b.footprint[0];
+          const centerPt = getCentroidWGS84(b.footprintGeometry);
           if (centerPt) {
             L.marker(centerPt, {
               icon: L.divIcon({

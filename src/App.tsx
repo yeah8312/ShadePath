@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Sun, Cloud, CloudRain, Navigation, Compass, Footprints, Info, MapPin, 
   ArrowUpDown, Layers, Sliders, Clock, ChevronDown, Activity, Settings, Search, Check, AlertCircle
@@ -12,6 +12,43 @@ import { LocationPreset, WeatherCondition, WeatherState, PathResult, SolarPositi
 import MapContainer from './components/MapContainer';
 import ControlPanel, { LOCATION_PRESETS } from './components/ControlPanel';
 import PathDetails from './components/PathDetails';
+
+export async function parseApiResponse(response: Response): Promise<any> {
+  const contentType = response.headers.get('Content-Type') || '';
+  const text = await response.text();
+  
+  if (!response.ok) {
+    console.error(`API Error response [Status: ${response.status}]:`, text);
+  }
+
+  if (!text.trim()) {
+    if (!response.ok) {
+      throw new Error(`API 호출 실패: 빈 응답 (HTTP 상태: ${response.status})`);
+    }
+    return {};
+  }
+
+  const isJson = contentType.includes('application/json');
+
+  if (isJson) {
+    try {
+      const data = JSON.parse(text);
+      if (!response.ok) {
+        throw new Error(data.message || data.error || `API 호출 실패 (HTTP 상태: ${response.status})`);
+      }
+      return data;
+    } catch (parseErr: any) {
+      if (parseErr.message && !parseErr.message.includes('Unexpected token')) {
+        throw parseErr;
+      }
+      const previewText = text.substring(0, 100);
+      throw new Error(`JSON 파싱 실패 (HTTP 상태: ${response.status}): ${previewText}`);
+    }
+  } else {
+    const previewText = text.substring(0, 200);
+    throw new Error(`잘못된 응답 형식 (Content-Type: ${contentType}, HTTP 상태: ${response.status}): ${previewText}`);
+  }
+}
 
 export default function App() {
   // --- Core States ---
@@ -54,8 +91,8 @@ export default function App() {
   const [realShortestPath, setRealShortestPath] = useState<PathResult | null>(null);
   
   // --- Stats and Sources ---
-  const [routingSource, setRoutingSource] = useState<string>('openrouteservice');
-  const [buildingSource, setBuildingSource] = useState<string>('overpass');
+  const [routingSource, setRoutingSource] = useState<string>('unknown');
+  const [buildingSource, setBuildingSource] = useState<string>('none');
   const [buildingCount, setBuildingCount] = useState<number>(0);
   const [shadowCount, setShadowCount] = useState<number>(0);
   const [degraded, setDegraded] = useState<boolean>(false);
@@ -66,6 +103,9 @@ export default function App() {
   const [routeError, setRouteError] = useState<string | null>(null);
   const [gpsLoading, setGpsLoading] = useState<boolean>(false);
   const [gpsError, setGpsError] = useState<string | null>(null);
+
+  // --- AbortController for cancelable requests ---
+  const routeAbortControllerRef = useRef<AbortController | null>(null);
 
   // --- Base System Clock ---
   const [baseTime] = useState<Date>(() => new Date());
@@ -107,15 +147,14 @@ export default function App() {
 
     try {
       const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
-      if (!response.ok) throw new Error('Geocoding call failed');
-      const data = await response.json();
+      const data = await parseApiResponse(response);
       
       if (type === 'start') {
         setStartSearchResults(data.results || []);
       } else {
         setEndSearchResults(data.results || []);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Geocoding error:', err);
     } finally {
       if (type === 'start') {
@@ -130,8 +169,7 @@ export default function App() {
   const performReverseGeocode = async (lat: number, lng: number, type: 'start' | 'end') => {
     try {
       const res = await fetch(`/api/reverse-geocode?lat=${lat}&lng=${lng}`);
-      if (!res.ok) throw new Error('Reverse geocode call failed');
-      const data = await res.json();
+      const data = await parseApiResponse(res);
       
       if (type === 'start') {
         setStartSearchQuery(data.name);
@@ -158,8 +196,25 @@ export default function App() {
 
   // --- Main API Trigger: Compute Shade Paths ---
   const fetchShadeRoutes = async () => {
-    setLoadingRoute(true);
+    // 1. Abort previous unfinished routing requests
+    if (routeAbortControllerRef.current) {
+      routeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    routeAbortControllerRef.current = controller;
+
+    // 2. Clear old state results (Requirement 9)
+    setRealBuildings([]);
+    setRealShadePath(null);
+    setRealShortestPath(null);
+    setBuildingCount(0);
+    setShadowCount(0);
+    setRoutingSource('unknown');
+    setBuildingSource('none');
+    setApiWarnings([]);
     setRouteError(null);
+
+    setLoadingRoute(true);
 
     const simTime = new Date(baseTime.getTime() + timeOffsetHours * 60 * 60 * 1000);
 
@@ -173,20 +228,11 @@ export default function App() {
           datetime: simTime.toISOString(),
           weatherCondition,
           shadeWeight
-        })
+        }),
+        signal: controller.signal
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        if (data.error === 'OVERPASS_UNAVAILABLE') {
-          throw new Error('실제 OSM 건물 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-        } else if (data.error === 'NO_BUILDINGS_FOUND') {
-          throw new Error('선택한 경로 주변에서 OSM 건물 데이터를 찾지 못했습니다.');
-        } else {
-          throw new Error(data.error || '그늘 경로 연산에 실패했습니다.');
-        }
-      }
+      const data = await parseApiResponse(res);
 
       setRealSolar(data.solar);
       setRealBuildings(data.buildings || []);
@@ -203,19 +249,28 @@ export default function App() {
       setRealShadePath(shade);
       setRealShortestPath(shortest);
     } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // Ignored, request was aborted by a newer request
+        return;
+      }
       console.error('API Error during route computation:', err);
       setRouteError(err.message || '서버 통신 오류가 발생했습니다.');
+      
+      // Keep cleared results on failure
+      setRealBuildings([]);
       setRealShadePath(null);
       setRealShortestPath(null);
+      setBuildingCount(0);
+      setShadowCount(0);
+      setRoutingSource('unknown');
+      setBuildingSource('none');
+      setApiWarnings([]);
     } finally {
-      setLoadingRoute(false);
+      if (routeAbortControllerRef.current === controller) {
+        setLoadingRoute(false);
+      }
     }
   };
-
-  // Synchronize on coordinate or simulation parameter changes
-  useEffect(() => {
-    fetchShadeRoutes();
-  }, [realStart, realEnd, timeOffsetHours, weatherCondition, shadeWeight]);
 
   // --- Swap start and end points instantly ---
   const handleSwapPoints = () => {
@@ -270,6 +325,12 @@ export default function App() {
   };
 
   const activeComfortIndex = realShadePath?.shadeRatio ?? 0;
+
+  const isSearchDisabled = 
+    !realStart || !realStart[0] || !realStart[1] ||
+    !realEnd || !realEnd[0] || !realEnd[1] ||
+    loadingRoute ||
+    (realStart[0] === realEnd[0] && realStart[1] === realEnd[1]);
 
   const formattedSimTime = useMemo(() => {
     const simTime = new Date(baseTime.getTime() + timeOffsetHours * 60 * 60 * 1000);
@@ -440,6 +501,23 @@ export default function App() {
               <ArrowUpDown className="w-3.5 h-3.5" />
             </button>
 
+          </div>
+
+          {/* 그늘길 찾기 Button (Explicit Manual Routing Request Button) */}
+          <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-100">
+            <button
+              id="find-shade-route-btn"
+              onClick={fetchShadeRoutes}
+              disabled={isSearchDisabled}
+              className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-md ${
+                isSearchDisabled
+                  ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none border border-slate-200'
+                  : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/10 active:scale-[0.98]'
+              }`}
+            >
+              <Footprints className="w-4 h-4" />
+              <span>그늘길 찾기</span>
+            </button>
           </div>
 
           {/* Preset Center Selector */}
