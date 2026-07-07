@@ -20,7 +20,7 @@ import PixelAnalyzer from './components/PixelAnalyzer';
 
 export default function App() {
   // --- Mode State (Real-world OSM vs Simulation) ---
-  const [isSimulationMode, setIsSimulationMode] = useState<boolean>(() => import.meta.env.VITE_SIMULATION_MODE === 'true');
+  const [isSimulationMode, setIsSimulationMode] = useState<boolean>(() => (import.meta as any).env.VITE_SIMULATION_MODE === 'true');
 
   // --- Common States ---
   const [currentLandmark, setCurrentLandmark] = useState<Landmark>(SIMULATED_LANDMARKS[0]);

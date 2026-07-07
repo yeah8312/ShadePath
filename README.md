@@ -31,11 +31,29 @@ ShadePath는 대면적 열섬 현상과 폭염 시기 동안 보행자를 뜨거
 
 ShadePath는 외부 서비스의 인증 키가 브라우저에 직접 노출되는 것을 차단하기 위해 서버 측 Express 프록시를 거치도록 구축되었습니다.
 
-`.env` 파일에 다음과 같이 구성합니다. (기본 설정 시 `.env.example` 복사 가능):
+### 🔑 Google AI Studio Secrets 등록 절차 (배포 및 개발 환경)
+
+1. **OpenRouteService API 키 발급**:
+   - [openrouteservice 공식 개발자 포털](https://openrouteservice.org/dev/#/login)에 가입하거나 로그인합니다.
+   - 대시보드(Dashboard)에서 새 API 토큰(Token)을 생성하고, 발급받은 API 키를 복사합니다.
+
+2. **Google AI Studio Secrets 패널 설정**:
+   - Google AI Studio의 설정 또는 환경 설정을 열고 **Secrets** 또는 **API Keys / Secrets** 메뉴로 이동합니다.
+   - 새 Secret 변수를 추가합니다:
+     - **Name**: `ORS_API_KEY`
+     - **Value**: `발급받은_실제_OpenRouteService_API_키`
+   - 등록 완료 시 서버가 런타임에서 `process.env.ORS_API_KEY`로 토큰을 안전하게 주입받아 사용하게 됩니다.
+
+### 💻 로컬 개발 환경 구성
+
+로컬 개발 환경에서는 프로젝트 루트에 `.env` 파일을 생성하고 다음과 같이 구성할 수 있습니다 (기본 설정 시 `.env.example` 복사 가능):
 
 ```env
-# AI Studio 자동으로 런타임에 삽입해 주는 기본 주소 정보
-APP_URL="http://localhost:3000"
+# OpenRouteService API Key (AI Studio Secrets와 동기화)
+ORS_API_KEY="YOUR_OPENROUTESERVICE_API_KEY"
+
+# Overpass API (건물 정보 수신 서버)
+OVERPASS_API_URL="https://overpass-api.de/api/interpreter"
 
 # 가상 격자 데모 개발 모드 강제 여부 (기본값 false: 실제 OSM 기반 동작)
 VITE_SIMULATION_MODE=false

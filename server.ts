@@ -236,6 +236,89 @@ app.get('/api/map-features', async (req, res) => {
   }
 });
 
+// Helper function to fetch OpenRouteService directions with robust error states
+async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat: number; lng: number }): Promise<any> {
+  const ORS_API_KEY = process.env.ORS_API_KEY;
+  if (!ORS_API_KEY) {
+    throw new Error('ORS_API_KEY_NOT_SET');
+  }
+
+  const url = 'https://api.openrouteservice.org/v2/directions/foot-walking/geojson';
+  const body = {
+    coordinates: [
+      [start.lng, start.lat],
+      [end.lng, end.lat]
+    ],
+    alternative_routes: {
+      target_count: 3,
+      weight_factor: 1.4,
+      share_factor: 0.6
+    }
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Accept': 'application/json, application/geo+json',
+      'Authorization': ORS_API_KEY
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (response.status === 429) {
+    throw new Error('RATE_LIMIT_EXCEEDED');
+  }
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`ORS_CALL_FAILED: ${response.status} - ${errText}`);
+  }
+
+  const data = await response.json();
+  if (!data || !data.features || data.features.length === 0) {
+    throw new Error('ROUTE_NOT_FOUND');
+  }
+
+  return data;
+}
+
+// Express API Route: POST /api/routes (Secure Directions API Proxy)
+app.post('/api/routes', async (req, res) => {
+  const { start, end } = req.body;
+
+  if (!start || typeof start.lat !== 'number' || typeof start.lng !== 'number' ||
+      !end || typeof end.lat !== 'number' || typeof end.lng !== 'number') {
+    return res.status(400).json({ error: 'Invalid start or end coordinates provided.' });
+  }
+
+  try {
+    const data = await fetchOrsRoutesRaw(start, end);
+    const routes = data.features.map((feature: any) => ({
+      geometry: {
+        type: 'LineString',
+        coordinates: feature.geometry.coordinates
+      },
+      distanceMeters: Math.round(feature.properties?.summary?.distance ?? 0),
+      durationSeconds: Math.round(feature.properties?.summary?.duration ?? 0)
+    }));
+
+    return res.json({ routes });
+  } catch (err: any) {
+    console.error('API Error /api/routes:', err.message);
+    if (err.message === 'ORS_API_KEY_NOT_SET') {
+      return res.status(500).json({ error: 'ORS_API_KEY environment variable is not configured.' });
+    }
+    if (err.message === 'RATE_LIMIT_EXCEEDED') {
+      return res.status(429).json({ error: 'OpenRouteService API rate limit exceeded. Please try again later.' });
+    }
+    if (err.message === 'ROUTE_NOT_FOUND') {
+      return res.status(404).json({ error: 'No pedestrian walking path could be found between the selected locations.' });
+    }
+    return res.status(502).json({ error: `Failed to call OpenRouteService API: ${err.message}` });
+  }
+});
+
 // Express API Route: POST /api/shade-route
 app.post('/api/shade-route', async (req, res) => {
   const { start, end, timeOffsetHours = 0, weatherCondition = 'sunny', shadeWeight = 50 } = req.body;
@@ -258,20 +341,37 @@ app.post('/api/shade-route', async (req, res) => {
   // If cloudy/rainy, solar intensity is negligible, shadows are thin or ambient (represented as 0 shadow length)
   const shadowLengthFactor = isCloudyOrRainy ? 0 : solar.shadowLengthRatio;
 
-  // 3. Request real walking candidate pathways from OSRM
-  const osrmUrl = `https://router.project-osrm.org/route/v1/foot/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&alternatives=true`;
+  // 3. Request real walking candidate pathways (prefer OpenRouteService, fallback to OSRM)
   let routesData: any = null;
 
-  try {
-    const osrmRes = await fetch(osrmUrl);
-    if (osrmRes.ok) {
-      routesData = await osrmRes.json();
+  if (process.env.ORS_API_KEY) {
+    try {
+      const orsData = await fetchOrsRoutesRaw(start, end);
+      routesData = {
+        routes: orsData.features.map((f: any) => ({
+          geometry: f.geometry,
+          distance: f.properties?.summary?.distance ?? 0,
+          duration: f.properties?.summary?.duration ?? 0
+        }))
+      };
+    } catch (err: any) {
+      console.warn('OpenRouteService routing failed in shade-route, falling back to OSRM:', err.message);
     }
-  } catch (err: any) {
-    console.error('OSRM route failed:', err.message);
   }
 
-  // Backup routing if OSRM fails completely
+  if (!routesData) {
+    const osrmUrl = `https://router.project-osrm.org/route/v1/foot/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&alternatives=true`;
+    try {
+      const osrmRes = await fetch(osrmUrl);
+      if (osrmRes.ok) {
+        routesData = await osrmRes.json();
+      }
+    } catch (err: any) {
+      console.error('OSRM route failed:', err.message);
+    }
+  }
+
+  // Backup routing if OSRM and ORS both fail completely
   if (!routesData || !routesData.routes || routesData.routes.length === 0) {
     // Generate simple straight/manhattan backup paths
     routesData = {
