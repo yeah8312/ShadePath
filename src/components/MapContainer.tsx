@@ -5,65 +5,58 @@
 
 import { useEffect, useRef } from 'react';
 import L from 'leaflet';
-import { GridCell, PathResult, SolarPosition } from '../types';
+import { PathResult, SolarPosition } from '../types';
 
 interface MapContainerProps {
   center: [number, number];
-  grid: GridCell[][];
   shadePath: PathResult | null;
   shortestPath: PathResult | null;
   solar: SolarPosition;
   showShadows: boolean;
   showBuildings: boolean;
-  showGreenery: boolean;
-  showGridLines: boolean;
-  onCellClick: (x: number, y: number, type: 'start' | 'end') => void;
-  startPoint: { x: number; y: number };
-  endPoint: { x: number; y: number };
+  onMapClick: (lat: number, lng: number, type: 'start' | 'end') => void;
+  startPoint: [number, number]; // [lat, lng]
+  endPoint: [number, number];   // [lat, lng]
   endPointName?: string;
-  // Real-world mode properties
-  isSimulationMode: boolean;
-  realStart: [number, number];
-  realEnd: [number, number];
   realBuildings: {
-    id: number;
+    osmId: string;
+    osmType: 'way' | 'relation';
+    featureType: 'building' | 'building:part';
     name: string;
     height: number;
     footprint: [number, number][];
     shadows: [number, number][][];
+    heightSource: string;
+    heightConfidence: string;
   }[];
-  onMapClick: (lat: number, lng: number, type: 'start' | 'end') => void;
+  showDiagnostics?: boolean;
 }
 
 export default function MapContainer({
   center,
-  grid,
   shadePath,
   shortestPath,
   solar,
   showShadows,
   showBuildings,
-  showGreenery,
-  showGridLines,
-  onCellClick,
+  onMapClick,
   startPoint,
   endPoint,
   endPointName = '목적지 지점',
-  isSimulationMode,
-  realStart,
-  realEnd,
   realBuildings,
-  onMapClick
+  showDiagnostics = false
 }: MapContainerProps) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   
   // Layer groups to manage drawings without recreating the map
-  const gridLayersRef = useRef<L.LayerGroup | null>(null);
+  const buildingLayersRef = useRef<L.LayerGroup | null>(null);
+  const shadowLayersRef = useRef<L.LayerGroup | null>(null);
   const pathLayersRef = useRef<L.LayerGroup | null>(null);
   const markerLayersRef = useRef<L.LayerGroup | null>(null);
+  const diagnosticLayersRef = useRef<L.LayerGroup | null>(null);
 
-  // Initialize Map
+  // Initialize Map exactly once
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
 
@@ -72,20 +65,22 @@ export default function MapContainer({
       center: center,
       zoom: 16,
       zoomControl: false,
-      minZoom: 13,
-      maxZoom: 19
+      minZoom: 12,
+      maxZoom: 20
     });
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
     // Standard high-quality OpenStreetMap tiles
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors'
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(map);
 
-    gridLayersRef.current = L.layerGroup().addTo(map);
+    shadowLayersRef.current = L.layerGroup().addTo(map);
+    buildingLayersRef.current = L.layerGroup().addTo(map);
     pathLayersRef.current = L.layerGroup().addTo(map);
     markerLayersRef.current = L.layerGroup().addTo(map);
+    diagnosticLayersRef.current = L.layerGroup().addTo(map);
 
     mapInstanceRef.current = map;
 
@@ -96,29 +91,7 @@ export default function MapContainer({
 
     // Set destination on map click
     map.on('click', (e: L.LeafletMouseEvent) => {
-      if (isSimulationMode) {
-        // Find closest grid cell
-        let closestCell: GridCell | null = null;
-        let minDistance = Infinity;
-
-        for (let y = 0; y < grid.length; y++) {
-          for (let x = 0; x < grid[y].length; x++) {
-            const cell = grid[y][x];
-            const dist = Math.sqrt(Math.pow(cell.lat - e.latlng.lat, 2) + Math.pow(cell.lng - e.latlng.lng, 2));
-            if (dist < minDistance) {
-              minDistance = dist;
-              closestCell = cell;
-            }
-          }
-        }
-
-        if (closestCell) {
-          onCellClick(closestCell.x, closestCell.y, 'end');
-        }
-      } else {
-        // Real world mode: update end point coordinates directly
-        onMapClick(e.latlng.lat, e.latlng.lng, 'end');
-      }
+      onMapClick(e.latlng.lat, e.latlng.lng, 'end');
     });
 
     return () => {
@@ -127,7 +100,7 @@ export default function MapContainer({
         mapInstanceRef.current = null;
       }
     };
-  }, [grid, isSimulationMode, onCellClick, onMapClick]);
+  }, [onMapClick]);
 
   // Handle map center changes smoothly
   useEffect(() => {
@@ -141,98 +114,83 @@ export default function MapContainer({
 
   // Redraw Building and Shadow footprints layer
   useEffect(() => {
-    const group = gridLayersRef.current;
-    if (!group) return;
+    const shadowGroup = shadowLayersRef.current;
+    const buildingGroup = buildingLayersRef.current;
+    const diagGroup = diagnosticLayersRef.current;
 
-    group.clearLayers();
+    if (!shadowGroup || !buildingGroup || !diagGroup) return;
 
-    if (isSimulationMode) {
-      // 25x25 Procedural Grid Simulation mode
-      const latHalf = 0.00015 / 2;
-      const lngHalf = 0.00022 / 2;
+    shadowGroup.clearLayers();
+    buildingGroup.clearLayers();
+    diagGroup.clearLayers();
 
-      for (let y = 0; y < grid.length; y++) {
-        for (let x = 0; x < grid[y].length; x++) {
-          const cell = grid[y][x];
-          const bounds: L.LatLngBoundsExpression = [
-            [cell.lat - latHalf, cell.lng - lngHalf],
-            [cell.lat + latHalf, cell.lng + lngHalf]
-          ];
+    // 1. Render shadows
+    if (showShadows && realBuildings) {
+      realBuildings.forEach(b => {
+        if (!b.shadows) return;
+        b.shadows.forEach(shadowPoly => {
+          if (shadowPoly.length === 0) return;
+          L.polygon(shadowPoly, {
+            stroke: false,
+            fillColor: '#1e293b',
+            fillOpacity: 0.5,
+            interactive: false
+          }).addTo(shadowGroup);
+        });
+      });
+    }
 
-          if (showGridLines) {
-            L.rectangle(bounds, {
-              color: '#cbd5e1',
-              weight: 0.5,
-              fill: false,
+    // 2. Render buildings
+    if (showBuildings && realBuildings) {
+      realBuildings.forEach(b => {
+        if (!b.footprint || b.footprint.length === 0) return;
+        
+        // Define building styling color based on feature type
+        const strokeColor = b.featureType === 'building:part' ? '#6366f1' : '#475569';
+        const fillColor = b.featureType === 'building:part' ? '#c7d2fe' : '#94a3b8';
+
+        const poly = L.polygon(b.footprint, {
+          color: strokeColor,
+          weight: 1,
+          fillColor: fillColor,
+          fillOpacity: 0.75,
+          interactive: true
+        });
+
+        // Detailed building popup with info
+        poly.bindPopup(`
+          <div class="font-sans text-xs flex flex-col gap-1 p-1">
+            <div class="font-bold text-gray-800 text-sm border-b pb-1 mb-1 flex items-center justify-between">
+              <span>🏢 ${b.name || '건물'}</span>
+              <span class="text-[10px] text-gray-400 font-mono">#${b.osmId}</span>
+            </div>
+            <div><span class="text-gray-500">유형:</span> <span class="font-semibold text-gray-700">${b.featureType === 'building:part' ? '건물 세부부품 (part)' : '기본 건물'}</span></div>
+            <div><span class="text-gray-500">실제 높이:</span> <span class="font-bold text-indigo-600">${b.height.toFixed(1)}m</span></div>
+            <div><span class="text-gray-500">높이 출처:</span> <span class="font-mono bg-gray-100 text-gray-600 px-1 py-0.5 rounded text-[10px]">${b.heightSource}</span></div>
+            <div><span class="text-gray-500">신뢰도:</span> <span class="font-semibold text-xs ${b.heightConfidence === 'high' ? 'text-emerald-600' : b.heightConfidence === 'medium' ? 'text-amber-500' : 'text-rose-500'}">${b.heightConfidence.toUpperCase()}</span></div>
+          </div>
+        `, { maxWidth: 220 });
+
+        poly.addTo(buildingGroup);
+
+        // Render diagnostics text label if activated
+        if (showDiagnostics) {
+          // Put height text at the centroid/first point
+          const centerPt = b.footprint[0];
+          if (centerPt) {
+            L.marker(centerPt, {
+              icon: L.divIcon({
+                html: `<div class="bg-black/80 text-white px-1 rounded text-[9px] font-mono whitespace-nowrap shadow-sm border border-slate-700">${b.height.toFixed(0)}m (${b.heightConfidence[0].toUpperCase()})</div>`,
+                className: 'diagnostic-label',
+                iconSize: [0, 0]
+              }),
               interactive: false
-            }).addTo(group);
-          }
-
-          if (showGreenery && cell.greeneryFactor > 0.1) {
-            L.rectangle(bounds, {
-              color: '#10b981',
-              weight: 0,
-              fillColor: '#10b981',
-              fillOpacity: cell.greeneryFactor * 0.35,
-              interactive: false
-            }).addTo(group);
-          }
-
-          if (showShadows && cell.isShadowed && cell.shadowIntensity > 0) {
-            L.rectangle(bounds, {
-              color: 'transparent',
-              weight: 0,
-              fillColor: '#1e293b',
-              fillOpacity: cell.shadowIntensity * 0.45,
-              interactive: false
-            }).addTo(group);
-          }
-
-          if (showBuildings && cell.buildingFactor > 0.1) {
-            L.rectangle(bounds, {
-              color: '#94a3b8',
-              weight: 1,
-              fillColor: '#cbd5e1',
-              fillOpacity: 0.75,
-              interactive: true
-            }).bindPopup(`<b>건물 차폐지구 (시뮬레이션)</b><br>높이: ${Math.round(cell.buildingFactor * 45)}m`)
-              .addTo(group);
+            }).addTo(diagGroup);
           }
         }
-      }
-    } else {
-      // Real-world OSM Mode: Render polygons fetched from Overpass API
-      
-      // 1. Shadows layer (rendered below buildings)
-      if (showShadows && realBuildings) {
-        realBuildings.forEach(b => {
-          if (!b.shadows) return;
-          b.shadows.forEach(shadowPoly => {
-            L.polygon(shadowPoly, {
-              stroke: false,
-              fillColor: '#1e293b',
-              fillOpacity: 0.48,
-              interactive: false
-            }).addTo(group);
-          });
-        });
-      }
-
-      // 2. Real Buildings layer
-      if (showBuildings && realBuildings) {
-        realBuildings.forEach(b => {
-          L.polygon(b.footprint, {
-            color: '#475569',
-            weight: 1,
-            fillColor: '#94a3b8',
-            fillOpacity: 0.75,
-            interactive: true
-          }).bindPopup(`<b>${b.name || '건물'}</b><br>높이: ${b.height}m`)
-            .addTo(group);
-        });
-      }
+      });
     }
-  }, [grid, isSimulationMode, realBuildings, showShadows, showBuildings, showGreenery, showGridLines]);
+  }, [realBuildings, showShadows, showBuildings, showDiagnostics]);
 
   // Redraw path polylines
   useEffect(() => {
@@ -251,7 +209,7 @@ export default function MapContainer({
         lineCap: 'round',
         lineJoin: 'round',
         interactive: true
-      }).bindTooltip(`🥵 뙤약볕 최단길 (${shortestPath.distance}m, 그늘 ${shortestPath.shadeRatio}%)`, { permanent: false, direction: 'top' })
+      }).bindTooltip(`🥵 뙤약볕 최단 직선 경로 (${shortestPath.distance}m, 그늘 ${shortestPath.shadeRatio}%)`, { permanent: false, direction: 'top' })
         .addTo(group);
     }
 
@@ -273,10 +231,10 @@ export default function MapContainer({
         lineCap: 'round',
         lineJoin: 'round',
         interactive: true
-      }).bindTooltip(`🌲 추천 그늘 안전길 (${shadePath.distance}m, 그늘 ${shadePath.shadeRatio}%)`, { 
+      }).bindTooltip(`🌲 실시간 추천 그늘 안전길 (${shadePath.distance}m, 그늘 ${shadePath.shadeRatio}%)`, { 
         permanent: true, 
         direction: 'top', 
-        className: 'font-sans font-bold text-emerald-800' 
+        className: 'font-sans font-bold text-emerald-800 shadow-lg border border-emerald-200 rounded-lg px-2 py-1' 
       }).addTo(group);
     }
   }, [shadePath, shortestPath]);
@@ -288,100 +246,50 @@ export default function MapContainer({
 
     group.clearLayers();
 
-    if (isSimulationMode) {
-      const startCell = grid[startPoint.y]?.[startPoint.x];
-      const endCell = grid[endPoint.y]?.[endPoint.x];
-
-      if (startCell) {
-        const startIcon = L.divIcon({
-          html: `
-            <div class="relative flex items-center justify-center w-10 h-10">
-              <span class="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping"></span>
-              <div class="relative w-8 h-8 rounded-full bg-emerald-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
-                출발
-              </div>
-            </div>
-          `,
-          className: 'custom-leaflet-icon',
-          iconSize: [40, 40],
-          iconAnchor: [20, 20]
-        });
-
-        L.marker([startCell.lat, startCell.lng], { icon: startIcon })
-          .bindPopup('<b>출발지 (가상 격자)</b>')
-          .addTo(group);
-      }
-
-      if (endCell) {
-        const endIcon = L.divIcon({
-          html: `
-            <div class="relative flex items-center justify-center w-10 h-10">
-              <span class="absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-60 animate-pulse"></span>
-              <div class="relative w-8 h-8 rounded-full bg-rose-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
-                도착
-              </div>
-            </div>
-          `,
-          className: 'custom-leaflet-icon',
-          iconSize: [40, 40],
-          iconAnchor: [20, 20]
-        });
-
-        L.marker([endCell.lat, endCell.lng], { icon: endIcon })
-          .bindPopup(`
-            <div class="font-sans text-xs flex flex-col gap-1 p-0.5">
-              <span class="font-bold text-gray-800 text-xs">📍 목적지 도착 지점</span>
-              <span class="text-gray-600 font-medium">${endPointName}</span>
-              <span class="text-[10px] text-gray-400 font-mono mt-1">Grid: X: ${endPoint.x}, Y: ${endPoint.y}</span>
-            </div>
-          `, { maxWidth: 220 })
-          .addTo(group);
-      }
-    } else {
-      // Real-world OSM markers
-      const startIcon = L.divIcon({
-        html: `
-          <div class="relative flex items-center justify-center w-10 h-10">
-            <span class="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60 animate-ping"></span>
-            <div class="relative w-8 h-8 rounded-full bg-blue-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
-              출발
-            </div>
+    // WGS84 markers
+    const startIcon = L.divIcon({
+      html: `
+        <div class="relative flex items-center justify-center w-10 h-10">
+          <span class="absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-60 animate-ping"></span>
+          <div class="relative w-8 h-8 rounded-full bg-indigo-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
+            출발
           </div>
-        `,
-        className: 'custom-leaflet-icon',
-        iconSize: [40, 40],
-        iconAnchor: [20, 20]
-      });
+        </div>
+      `,
+      className: 'custom-leaflet-icon',
+      iconSize: [40, 40],
+      iconAnchor: [20, 20]
+    });
 
-      L.marker(realStart, { icon: startIcon })
-        .bindPopup('<b>출발 위치 (내 위치)</b>')
-        .addTo(group);
+    L.marker(startPoint, { icon: startIcon })
+      .bindPopup('<b>📍 출발지 (검색 위치)</b>')
+      .addTo(group);
 
-      const endIcon = L.divIcon({
-        html: `
-          <div class="relative flex items-center justify-center w-10 h-10">
-            <span class="absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-60 animate-pulse"></span>
-            <div class="relative w-8 h-8 rounded-full bg-rose-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
-              도착
-            </div>
+    const endIcon = L.divIcon({
+      html: `
+        <div class="relative flex items-center justify-center w-10 h-10">
+          <span class="absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-60 animate-pulse"></span>
+          <div class="relative w-8 h-8 rounded-full bg-rose-600 border-4 border-white shadow-lg flex items-center justify-center text-white font-sans font-bold text-xs">
+            도착
           </div>
-        `,
-        className: 'custom-leaflet-icon',
-        iconSize: [40, 40],
-        iconAnchor: [20, 20]
-      });
+        </div>
+      `,
+      className: 'custom-leaflet-icon',
+      iconSize: [40, 40],
+      iconAnchor: [20, 20]
+    });
 
-      L.marker(realEnd, { icon: endIcon })
-        .bindPopup(`
-          <div class="font-sans text-xs flex flex-col gap-1 p-0.5">
-            <span class="font-bold text-gray-800 text-xs">📍 목적지 도착 지점</span>
-            <span class="text-gray-600 font-medium">${endPointName}</span>
-            <span class="text-[10px] text-gray-400 font-mono mt-1">WGS84: ${realEnd[0].toFixed(5)}, ${realEnd[1].toFixed(5)}</span>
-          </div>
-        `, { maxWidth: 220 })
-        .addTo(group);
-    }
-  }, [grid, isSimulationMode, startPoint, endPoint, realStart, realEnd, endPointName]);
+    L.marker(endPoint, { icon: endIcon })
+      .bindPopup(`
+        <div class="font-sans text-xs flex flex-col gap-1 p-0.5">
+          <span class="font-bold text-gray-800 text-xs">📍 목적지 도착 지점</span>
+          <span class="text-gray-600 font-medium">${endPointName}</span>
+          <span class="text-[10px] text-gray-400 font-mono mt-1">WGS84: ${endPoint[0].toFixed(5)}, ${endPoint[1].toFixed(5)}</span>
+        </div>
+      `, { maxWidth: 220 })
+      .addTo(group);
+
+  }, [startPoint, endPoint, endPointName]);
 
   return (
     <div className="relative w-full h-full rounded-2xl overflow-hidden shadow-xl border border-gray-100 bg-gray-50">
@@ -411,12 +319,7 @@ export default function MapContainer({
       {/* Guide Banner */}
       <div className="absolute bottom-4 left-4 z-[1000] bg-slate-900/95 backdrop-blur-md text-white px-3.5 py-2 rounded-lg shadow-md border border-slate-700/50 font-sans text-[11px] pointer-events-none flex items-center gap-1.5">
         <span>📍</span>
-        <span>
-          {isSimulationMode 
-            ? '시뮬레이션 가상 맵: 지도를 터치하여 목적지 격자를 변경합니다.'
-            : '실제 위경도 보행 맵: 지도의 임의의 도로를 터치하여 새로운 실시간 도착지를 지정하세요.'
-          }
-        </span>
+        <span>실제 위경도 보행 맵: 지도의 임의의 도로를 터치하여 새로운 실시간 도착지를 지정하세요.</span>
       </div>
     </div>
   );

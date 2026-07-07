@@ -3,133 +3,115 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import * as SunCalc from 'suncalc';
+import proj4 from 'proj4';
+import osmtogeojson from 'osmtogeojson';
+import * as turf from '@turf/turf';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
-// In-memory cache for Overpass API responses (expires in 10 minutes)
-interface CacheEntry {
-  timestamp: number;
-  data: any;
-}
-const overpassCache = new Map<string, CacheEntry>();
+// In-memory caches with short TTL
+const overpassCache = new Map<string, { timestamp: number; data: any }>();
+const geocodeCache = new Map<string, { timestamp: number; data: any }>();
+const reverseGeocodeCache = new Map<string, { timestamp: number; data: any }>();
+
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-// Web Mercator EPSG:3857 Projection Utilities for precise metric operations
-const R_EARTH = 6378137;
+// Projection string for WGS84 (lat/lng)
+const wgs84 = "+proj=longlat +datum=WGS84 +no_defs";
 
-function latLngToMeters(lat: number, lng: number): { x: number; y: number } {
-  const x = R_EARTH * lng * Math.PI / 180;
-  const y = R_EARTH * Math.log(Math.tan((90 + lat) * Math.PI / 360));
-  return { x, y };
+// Helper to determine the UTM Zone projection string based on a center coordinate
+export function getUTMProjString(lat: number, lng: number): string {
+  const zone = Math.floor((lng + 180) / 6) + 1;
+  const isSouth = lat < 0;
+  return `+proj=utm +zone=${zone} +datum=WGS84 +units=m +no_defs${isSouth ? ' +south' : ''}`;
 }
 
-function metersToLatLng(x: number, y: number): { lat: number; lng: number } {
-  const lng = x * 180 / (Math.PI * R_EARTH);
-  const lat = 360 / Math.PI * Math.atan(Math.exp(y / R_EARTH)) - 90;
-  return { lat, lng };
-}
-
-// Point in Polygon check (Ray casting algorithm)
-function isPointInPolygon(point: { x: number; y: number }, vs: { x: number; y: number }[]): boolean {
-  const x = point.x, y = point.y;
-  let inside = false;
-  for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
-    const xi = vs[i].x, yi = vs[i].y;
-    const xj = vs[j].x, yj = vs[j].y;
-    const intersect = ((yi > y) !== (yj > y))
-        && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-    if (intersect) inside = !inside;
+// Parse height from tags with fallback rules
+export function getBuildingHeight(tags: any): {
+  height: number;
+  heightSource: 'height' | 'est_height' | 'levels-estimate' | 'type-fallback';
+  heightConfidence: 'high' | 'medium' | 'low';
+} {
+  if (!tags) {
+    return { height: 10, heightSource: 'type-fallback', heightConfidence: 'low' };
   }
-  return inside;
-}
 
-// Parse height from Overpass tags with prioritized rules
-function getBuildingHeight(tags: any): number {
-  if (!tags) return 12; // default fallback
+  const parseHeightString = (str: string): number | null => {
+    str = str.trim().toLowerCase();
+    // Support feet and inches like 30 ft or 30' 6"
+    if (str.includes('ft') || str.includes('feet') || str.includes("'")) {
+      const feetMatch = str.match(/([0-9.]+)\s*(ft|feet|')/);
+      if (feetMatch) {
+        const feet = parseFloat(feetMatch[1]);
+        let inches = 0;
+        const inchMatch = str.match(/([0-9.]+)\s*(in|inches|")/);
+        if (inchMatch) {
+          inches = parseFloat(inchMatch[1]);
+        }
+        if (!isNaN(feet)) {
+          return (feet + inches / 12) * 0.3048;
+        }
+      }
+    }
+    const mMatch = str.match(/([0-9.]+)\s*(m|meters)?/);
+    if (mMatch) {
+      const val = parseFloat(mMatch[1]);
+      if (!isNaN(val)) return val;
+    }
+    return null;
+  };
+
   if (tags.height) {
-    const parsed = parseFloat(tags.height);
-    if (!isNaN(parsed)) return parsed;
+    const h = parseHeightString(tags.height);
+    if (h !== null) {
+      return { height: h, heightSource: 'height', heightConfidence: 'high' };
+    }
   }
+
+  if (tags.est_height) {
+    const h = parseHeightString(tags.est_height);
+    if (h !== null) {
+      return { height: h, heightSource: 'est_height', heightConfidence: 'medium' };
+    }
+  }
+
   if (tags['building:levels']) {
     const levels = parseFloat(tags['building:levels']);
-    if (!isNaN(levels)) return levels * 3.0; // 3m per level
-  }
-  const type = tags.building;
-  if (type === 'apartments' || type === 'residential') return 15;
-  if (type === 'office' || type === 'commercial') return 18;
-  if (type === 'house' || type === 'detached') return 6;
-  if (type === 'retail') return 9;
-  return 12; // generic fallback
-}
-
-// Solar elevation & azimuth calculations
-function calculateSolarPosition(lat: number, lng: number, date: Date) {
-  const radian = Math.PI / 180;
-  const start = new Date(date.getFullYear(), 0, 0);
-  const diff = date.getTime() - start.getTime();
-  const oneDay = 1000 * 60 * 60 * 24;
-  const N = Math.floor(diff / oneDay);
-
-  // Solar Declination (delta)
-  const delta = 23.45 * Math.sin(radian * (360 / 365 * (284 + N)));
-
-  // Hour Angle (H)
-  const hours = date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
-  const H = (hours - 12) * 15;
-
-  const latRad = lat * radian;
-  const deltaRad = delta * radian;
-  const hRad = H * radian;
-
-  // sin(h) solar elevation
-  const sin_h = Math.sin(latRad) * Math.sin(deltaRad) +
-                Math.cos(latRad) * Math.cos(deltaRad) * Math.cos(hRad);
-  
-  const clamped_sin_h = Math.max(-1, Math.min(1, sin_h));
-  const elevation = Math.asin(clamped_sin_h) / radian; // in degrees
-
-  const cos_h = Math.cos(Math.asin(clamped_sin_h));
-  let azimuth = 0;
-  if (cos_h !== 0 && Math.cos(latRad) !== 0) {
-    const cos_A = (Math.sin(deltaRad) - Math.sin(latRad) * clamped_sin_h) / (Math.cos(latRad) * cos_h);
-    azimuth = Math.acos(Math.max(-1, Math.min(1, cos_A))) / radian;
-    if (hours > 12) {
-      azimuth = 360 - azimuth;
-    }
-  } else {
-    azimuth = hours > 12 ? 270 : 90;
-  }
-
-  let shadowLengthRatio = 0;
-  if (elevation > 0) {
-    const eleRad = elevation * radian;
-    if (elevation < 3) {
-      shadowLengthRatio = 8.0; // limit shadow elongation near horizon
-    } else {
-      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(eleRad));
+    if (!isNaN(levels)) {
+      const height = levels * 3.0 + 1.5;
+      return { height, heightSource: 'levels-estimate', heightConfidence: 'medium' };
     }
   }
 
-  return { elevation, azimuth, shadowLengthRatio };
+  const type = tags.building || '';
+  let defaultHeight = 10;
+  if (type === 'apartments' || type === 'residential') defaultHeight = 15;
+  else if (type === 'office' || type === 'commercial') defaultHeight = 18;
+  else if (type === 'house' || type === 'detached') defaultHeight = 6;
+  else if (type === 'retail') defaultHeight = 9;
+
+  return { height: defaultHeight, heightSource: 'type-fallback', heightConfidence: 'low' };
 }
 
-// 5-meter sampling along a metric path segment
-function samplePathAtInterval(coords: { x: number; y: number }[], interval: number): { x: number; y: number }[] {
+// 5-meter sampling along a metric path coordinate list in UTM space
+export function samplePathMeters(coords: [number, number][], interval: number): [number, number][] {
   if (coords.length === 0) return [];
-  const samples: { x: number; y: number }[] = [coords[0]];
+  const samples: [number, number][] = [coords[0]];
   let distAccum = 0;
 
   for (let i = 0; i < coords.length - 1; i++) {
     const p1 = coords[i];
     const p2 = coords[i + 1];
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
+    const dx = p2[0] - p1[0];
+    const dy = p2[1] - p1[1];
     const segLen = Math.sqrt(dx * dx + dy * dy);
     if (segLen === 0) continue;
 
@@ -138,105 +120,121 @@ function samplePathAtInterval(coords: { x: number; y: number }[], interval: numb
       const remaining = interval - distAccum;
       fraction += remaining;
       const t = fraction / segLen;
-      samples.push({
-        x: p1.x + t * dx,
-        y: p1.y + t * dy
-      });
+      samples.push([p1[0] + t * dx, p1[1] + t * dy]);
       distAccum = 0;
     }
     distAccum += (segLen - fraction);
   }
-
   if (coords.length > 1) {
     samples.push(coords[coords.length - 1]);
   }
   return samples;
 }
 
-// Dynamic building generator for offline/fallback simulation to ensure high resilience
-function generateProceduralBuildings(centerLat: number, centerLng: number) {
-  const buildings: any[] = [];
-  const spacing = 0.0008; // ~80m spacing
-  for (let latOffset = -3; latOffset <= 3; latOffset++) {
-    for (let lngOffset = -3; lngOffset <= 3; lngOffset++) {
-      if ((latOffset + lngOffset) % 2 === 0) continue; // checkerboard style layout
-      const bLat = centerLat + latOffset * spacing;
-      const bLng = centerLng + lngOffset * spacing;
-      const size = 0.00025; // ~25m footprint
-      
-      buildings.push({
-        type: 'way',
-        id: Math.floor(Math.random() * 10000000),
-        tags: {
-          building: 'office',
-          'building:levels': '5',
-          name: '시뮬레이션 오피스 빌딩'
-        },
-        geometry: [
-          { lat: bLat - size, lon: bLng - size },
-          { lat: bLat + size, lon: bLng - size },
-          { lat: bLat + size, lon: bLng + size },
-          { lat: bLat - size, lon: bLng + size },
-          { lat: bLat - size, lon: bLng - size } // close loop
-        ]
+// Helper to project a geojson geometry into UTM coordinates
+function projectGeometryToUTM(geom: any, utmProj: string): any {
+  if (geom.type === 'Polygon') {
+    const rings = geom.coordinates.map((ring: any) => {
+      return ring.map((pt: number[]) => proj4(wgs84, utmProj, pt));
+    });
+    return { type: 'Polygon', coordinates: rings };
+  } else if (geom.type === 'MultiPolygon') {
+    const polys = geom.coordinates.map((polyCoords: any) => {
+      return polyCoords.map((ring: any) => {
+        return ring.map((pt: number[]) => proj4(wgs84, utmProj, pt));
       });
-    }
+    });
+    return { type: 'MultiPolygon', coordinates: polys };
   }
-  return buildings;
+  return geom;
 }
 
-// Express API Route: GET /api/map-features?bbox=south,west,north,east
-app.get('/api/map-features', async (req, res) => {
-  const bboxStr = req.query.bbox as string;
-  if (!bboxStr) {
-    return res.status(400).json({ error: 'bbox parameter is required' });
-  }
-
-  // Check in-memory cache
-  const cached = overpassCache.get(bboxStr);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return res.json(cached.data);
-  }
-
-  const [south, west, north, east] = bboxStr.split(',').map(parseFloat);
-  if (isNaN(south) || isNaN(west) || isNaN(north) || isNaN(east)) {
-    return res.status(400).json({ error: 'Invalid bbox format. Expected: south,west,north,east' });
-  }
-
-  const overpassQuery = `
-    [out:json][timeout:25];
-    (
-      way["building"](${south},${west},${north},${east});
-      relation["building"](${south},${west},${north},${east});
-    );
-    out geom;
-  `;
-
-  try {
-    const response = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      body: overpassQuery,
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+// Helper to project a geojson geometry back to WGS84
+function projectGeometryToWGS84(geom: any, utmProj: string): any {
+  if (geom.type === 'Polygon') {
+    const rings = geom.coordinates.map((ring: any) => {
+      return ring.map((pt: number[]) => proj4(utmProj, wgs84, pt));
     });
+    return { type: 'Polygon', coordinates: rings };
+  } else if (geom.type === 'MultiPolygon') {
+    const polys = geom.coordinates.map((polyCoords: any) => {
+      return polyCoords.map((ring: any) => {
+        return ring.map((pt: number[]) => proj4(utmProj, wgs84, pt));
+      });
+    });
+    return { type: 'MultiPolygon', coordinates: polys };
+  }
+  return geom;
+}
 
-    if (!response.ok) {
-      throw new Error(`Overpass API responded with status ${response.status}`);
+// Translate geometry in UTM space
+export function translatePolygonUTM(geom: any, dx: number, dy: number): any {
+  if (geom.type === 'Polygon') {
+    const rings = geom.coordinates.map((ring: any) => {
+      return ring.map((pt: number[]) => [pt[0] + dx, pt[1] + dy]);
+    });
+    return { type: 'Polygon', coordinates: rings };
+  } else if (geom.type === 'MultiPolygon') {
+    const polys = geom.coordinates.map((polyCoords: any) => {
+      return polyCoords.map((ring: any) => {
+        return ring.map((pt: number[]) => [pt[0] + dx, pt[1] + dy]);
+      });
+    });
+    return { type: 'MultiPolygon', coordinates: polys };
+  }
+  return geom;
+}
+
+// Create side projection polygons from original footprint to translated footprint in UTM space
+export function createSidePolygonsUTM(original: any, translated: any): any[] {
+  const sideQuads: any[] = [];
+  
+  const processRing = (origRing: [number, number][], transRing: [number, number][]) => {
+    // Both rings must have the same length
+    for (let i = 0; i < origRing.length - 1; i++) {
+      const pA = origRing[i];
+      const pB = origRing[i + 1];
+      const sA = transRing[i];
+      const sB = transRing[i + 1];
+      
+      sideQuads.push(turf.polygon([[pA, pB, sB, sA, pA]]));
+    }
+  };
+
+  if (original.type === 'Polygon') {
+    // Process exterior ring
+    processRing(original.coordinates[0], translated.coordinates[0]);
+  } else if (original.type === 'MultiPolygon') {
+    for (let p = 0; p < original.coordinates.length; p++) {
+      processRing(original.coordinates[p][0], translated.coordinates[p][0]);
+    }
+  }
+
+  return sideQuads;
+}
+
+// Union geometries in UTM space
+export function unionShadowUTM(footprint: any, translated: any, sideQuads: any[]): any {
+  try {
+    let shadowFeature = turf.feature(footprint);
+    const transFeature = turf.feature(translated);
+
+    const merged = turf.union(turf.featureCollection([shadowFeature, transFeature]));
+    if (merged) shadowFeature = merged;
+
+    if (sideQuads.length > 0) {
+      const batchMerged = turf.union(turf.featureCollection([shadowFeature, ...sideQuads]));
+      if (batchMerged) shadowFeature = batchMerged;
     }
 
-    const data = await response.json();
-    overpassCache.set(bboxStr, { timestamp: Date.now(), data });
-    return res.json(data);
-  } catch (error: any) {
-    console.error('Overpass API failed. Loading procedural backup features:', error.message);
-    // Dynamic procedural fallback centered at the requested bbox
-    const centerLat = (south + north) / 2;
-    const centerLng = (west + east) / 2;
-    const backupFeatures = { elements: generateProceduralBuildings(centerLat, centerLng) };
-    return res.json(backupFeatures);
+    return shadowFeature.geometry;
+  } catch (e) {
+    console.warn('Turf union failed, using fallback bounding shadow:', e);
+    return translated;
   }
-});
+}
 
-// Helper function to fetch OpenRouteService directions with robust error states
+// Robust OpenRouteService call
 async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat: number; lng: number }): Promise<any> {
   const ORS_API_KEY = process.env.ORS_API_KEY;
   if (!ORS_API_KEY) {
@@ -283,66 +281,146 @@ async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat
   return data;
 }
 
-// Express API Route: POST /api/routes (Secure Directions API Proxy)
-app.post('/api/routes', async (req, res) => {
-  const { start, end } = req.body;
+// --- Geocoding API Endpoints ---
+app.get('/api/geocode', async (req, res) => {
+  const q = (req.query.q as string || '').trim();
+  if (!q) {
+    return res.status(400).json({ error: 'Search query is required' });
+  }
+  if (q.length > 150) {
+    return res.status(400).json({ error: 'Search query is too long' });
+  }
 
-  if (!start || typeof start.lat !== 'number' || typeof start.lng !== 'number' ||
-      !end || typeof end.lat !== 'number' || typeof end.lng !== 'number') {
-    return res.status(400).json({ error: 'Invalid start or end coordinates provided.' });
+  const cached = geocodeCache.get(q);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return res.json({ results: cached.data });
   }
 
   try {
-    const data = await fetchOrsRoutesRaw(start, end);
-    const routes = data.features.map((feature: any) => ({
-      geometry: {
-        type: 'LineString',
-        coordinates: feature.geometry.coordinates
-      },
-      distanceMeters: Math.round(feature.properties?.summary?.distance ?? 0),
-      durationSeconds: Math.round(feature.properties?.summary?.duration ?? 0)
-    }));
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5&addressdetails=1`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'ShadePath/1.0 (cksgma3218@gmail.com)',
+        'Accept-Language': 'ko,en'
+      }
+    });
 
-    return res.json({ routes });
+    if (!response.ok) {
+      throw new Error(`Nominatim returned status ${response.status}`);
+    }
+
+    const data = await response.json();
+    const results = (data || []).map((item: any) => ({
+      name: item.name || item.display_name.split(',')[0],
+      displayName: item.display_name,
+      lat: parseFloat(item.lat),
+      lng: parseFloat(item.lon)
+    })).filter((item: any) => !isNaN(item.lat) && !isNaN(item.lng));
+
+    geocodeCache.set(q, { timestamp: Date.now(), data: results });
+    return res.json({ results });
   } catch (err: any) {
-    console.error('API Error /api/routes:', err.message);
-    if (err.message === 'ORS_API_KEY_NOT_SET') {
-      return res.status(500).json({ error: 'ORS_API_KEY environment variable is not configured.' });
-    }
-    if (err.message === 'RATE_LIMIT_EXCEEDED') {
-      return res.status(429).json({ error: 'OpenRouteService API rate limit exceeded. Please try again later.' });
-    }
-    if (err.message === 'ROUTE_NOT_FOUND') {
-      return res.status(404).json({ error: 'No pedestrian walking path could be found between the selected locations.' });
-    }
-    return res.status(502).json({ error: `Failed to call OpenRouteService API: ${err.message}` });
+    console.error('Geocoding error:', err.message);
+    return res.status(502).json({ error: '지오코딩 서비스를 사용할 수 없습니다.' });
   }
 });
 
-// Express API Route: POST /api/shade-route
-app.post('/api/shade-route', async (req, res) => {
-  const { start, end, timeOffsetHours = 0, weatherCondition = 'sunny', shadeWeight = 50 } = req.body;
+app.get('/api/reverse-geocode', async (req, res) => {
+  const lat = parseFloat(req.query.lat as string);
+  const lng = parseFloat(req.query.lng as string);
 
-  if (!start || !end) {
-    return res.status(400).json({ error: 'Start and End coordinates are required' });
+  if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return res.status(400).json({ error: 'Invalid coordinates' });
   }
 
-  // 1. Calculate Solar Coordinates
-  const now = new Date();
-  const simTime = new Date(now.getTime() + timeOffsetHours * 60 * 60 * 1000);
+  const cacheKey = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+  const cached = reverseGeocodeCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return res.json(cached.data);
+  }
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'ShadePath/1.0 (cksgma3218@gmail.com)',
+        'Accept-Language': 'ko,en'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Nominatim returned status ${response.status}`);
+    }
+
+    const item = await response.json();
+    const result = {
+      name: item.name || item.display_name?.split(',')[0] || '지정된 위치',
+      displayName: item.display_name || '알 수 없는 주소',
+      lat,
+      lng
+    };
+
+    reverseGeocodeCache.set(cacheKey, { timestamp: Date.now(), data: result });
+    return res.json(result);
+  } catch (err: any) {
+    console.error('Reverse geocoding error:', err.message);
+    return res.status(502).json({ error: '역지오코딩 서비스를 사용할 수 없습니다.' });
+  }
+});
+
+// --- Main Pedestrian Shade Route Endpoint ---
+app.post('/api/shade-route', async (req, res) => {
+  const { start, end, datetime, weatherCondition = 'sunny', shadeWeight = 50 } = req.body;
+
+  if (!start || typeof start.lat !== 'number' || typeof start.lng !== 'number' ||
+      !end || typeof end.lat !== 'number' || typeof end.lng !== 'number') {
+    return res.status(400).json({ error: '출발지와 도착지 위경도 정보가 올바르지 않습니다.' });
+  }
+
+  if (!datetime) {
+    return res.status(400).json({ error: '계산 기준 일시(datetime)가 필요합니다.' });
+  }
+
+  const targetTime = new Date(datetime);
+  if (isNaN(targetTime.getTime())) {
+    return res.status(400).json({ error: '올바르지 않은 datetime 형식입니다.' });
+  }
+
+  // Calculate center of the area
   const routeCenterLat = (start.lat + end.lat) / 2;
   const routeCenterLng = (start.lng + end.lng) / 2;
-  const solar = calculateSolarPosition(routeCenterLat, routeCenterLng, simTime);
 
-  // 2. Compute solar displacement vector for building shadows (pointing opposite to sun)
-  const isCloudyOrRainy = weatherCondition === 'cloudy' || weatherCondition === 'rainy';
-  const shadowAngleRad = ((solar.azimuth + 180) % 360) * (Math.PI / 180);
+  // 1. Calculate Solar Coordinates using suncalc
+  const position = SunCalc.getPosition(targetTime, routeCenterLat, routeCenterLng);
+  const elevationDeg = position.altitude * (180 / Math.PI);
   
-  // If cloudy/rainy, solar intensity is negligible, shadows are thin or ambient (represented as 0 shadow length)
-  const shadowLengthFactor = isCloudyOrRainy ? 0 : solar.shadowLengthRatio;
+  // Convert SunCalc azimuth (South is 0, clockwise positive) to standard 0-360 (North is 0, clockwise positive)
+  const azimuthDeg = (position.azimuth * (180 / Math.PI) + 180) % 360;
 
-  // 3. Request real walking candidate pathways (prefer OpenRouteService, fallback to OSRM)
+  // Shadow length ratio = 1 / tan(elevation)
+  let shadowLengthRatio = 0;
+  if (position.altitude > 0) {
+    if (elevationDeg < 3) {
+      shadowLengthRatio = 8.0;
+    } else {
+      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(position.altitude));
+    }
+  }
+
+  const solar = {
+    elevation: elevationDeg,
+    azimuth: azimuthDeg,
+    shadowLengthRatio
+  };
+
+  const isCloudyOrRainy = weatherCondition === 'cloudy' || weatherCondition === 'rainy';
+  const shadowLengthFactor = isCloudyOrRainy ? 0 : solar.shadowLengthRatio;
+  const shadowBearing = (solar.azimuth + 180) % 360;
+
+  // 2. Request walking routes (prefer ORS, fallback to OSRM)
   let routesData: any = null;
+  let routingSource = "openrouteservice";
+  const warnings: string[] = [];
 
   if (process.env.ORS_API_KEY) {
     try {
@@ -355,231 +433,302 @@ app.post('/api/shade-route', async (req, res) => {
         }))
       };
     } catch (err: any) {
-      console.warn('OpenRouteService routing failed in shade-route, falling back to OSRM:', err.message);
+      console.warn('OpenRouteService routing failed, falling back to OSRM:', err.message);
+      warnings.push(`OpenRouteService 라우팅 오류로 OSRM 폴백 사용: ${err.message}`);
     }
+  } else {
+    warnings.push("ORS_API_KEY가 비어 있어 기본 OSRM 라우터를 사용합니다.");
   }
 
   if (!routesData) {
+    routingSource = "osrm";
     const osrmUrl = `https://router.project-osrm.org/route/v1/foot/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&alternatives=true`;
     try {
       const osrmRes = await fetch(osrmUrl);
-      if (osrmRes.ok) {
-        routesData = await osrmRes.json();
+      if (!osrmRes.ok) {
+        throw new Error(`OSRM returned HTTP ${osrmRes.status}`);
       }
+      const data = await osrmRes.json();
+      if (!data || !data.routes || data.routes.length === 0) {
+        throw new Error('OSRM returned empty routes');
+      }
+      routesData = {
+        routes: data.routes.map((r: any) => ({
+          geometry: r.geometry,
+          distance: r.distance,
+          duration: r.duration
+        }))
+      };
     } catch (err: any) {
       console.error('OSRM route failed:', err.message);
+      return res.status(502).json({ error: '보행 경로 데이터를 불러오는 데 실패했습니다.' });
     }
   }
 
-  // Backup routing if OSRM and ORS both fail completely
-  if (!routesData || !routesData.routes || routesData.routes.length === 0) {
-    // Generate simple straight/manhattan backup paths
-    routesData = {
-      routes: [
-        {
-          geometry: {
-            type: 'LineString',
-            coordinates: [
-              [start.lng, start.lat],
-              [end.lng, end.lat]
-            ]
-          },
-          distance: 1000,
-          duration: 720
-        },
-        {
-          geometry: {
-            type: 'LineString',
-            coordinates: [
-              [start.lng, start.lat],
-              [start.lng, end.lat],
-              [end.lng, end.lat]
-            ]
-          },
-          distance: 1400,
-          duration: 1000
-        }
-      ]
-    };
+  // 3. Compute precise bounding box around actual candidate route coordinates
+  const allCoords: [number, number][] = [];
+  for (const r of routesData.routes) {
+    if (r.geometry && r.geometry.coordinates) {
+      r.geometry.coordinates.forEach((c: number[]) => {
+        allCoords.push([c[1], c[0]]); // [lat, lng]
+      });
+    }
+  }
+  allCoords.push([start.lat, start.lng]);
+  allCoords.push([end.lat, end.lng]);
+
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const [lat, lng] of allCoords) {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
   }
 
-  // 4. Fetch building geometries around routes for shadow intersections
-  const pad = 0.003; // ~300 meters padding around the start-end segment
-  const south = Math.min(start.lat, end.lat) - pad;
-  const north = Math.max(start.lat, end.lat) + pad;
-  const west = Math.min(start.lng, end.lng) - pad;
-  const east = Math.max(start.lng, end.lng) + pad;
-  const bboxKey = `${south},${west},${north},${east}`;
+  // 200m buffer padding in lat/lng degrees
+  const bufferMeters = 200;
+  const latBuffer = bufferMeters / 111320;
+  const lngBuffer = bufferMeters / (111320 * Math.cos(routeCenterLat * Math.PI / 180));
 
-  let buildingElements: any[] = [];
+  const south = minLat - latBuffer;
+  const north = maxLat + latBuffer;
+  const west = minLng - lngBuffer;
+  const east = maxLng + lngBuffer;
+
+  const bboxKey = `${south.toFixed(4)},${west.toFixed(4)},${north.toFixed(4)},${east.toFixed(4)}`;
+
+  // 4. Fetch real OSM buildings using Overpass API
+  let overpassData: any = null;
+  const OVERPASS_API_URL = process.env.OVERPASS_API_URL ?? 'https://overpass-api.de/api/interpreter';
+
   try {
     const cached = overpassCache.get(bboxKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-      buildingElements = cached.data.elements;
+      overpassData = cached.data;
     } else {
       const overpassQuery = `
-        [out:json][timeout:15];
+        [out:json][timeout:25];
         (
           way["building"](${south},${west},${north},${east});
+          relation["building"]["type"="multipolygon"](${south},${west},${north},${east});
+          way["building:part"](${south},${west},${north},${east});
+          relation["building:part"]["type"="multipolygon"](${south},${west},${north},${east});
         );
-        out geom;
+        out body geom;
       `;
-      const overpassRes = await fetch('https://overpass-api.de/api/interpreter', {
+
+      const response = await fetch(OVERPASS_API_URL, {
         method: 'POST',
-        body: overpassQuery,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'Accept': 'application/json'
+        },
+        body: new URLSearchParams({ data: overpassQuery })
       });
-      if (overpassRes.ok) {
-        const opData = await overpassRes.json();
-        overpassCache.set(bboxKey, { timestamp: Date.now(), data: opData });
-        buildingElements = opData.elements || [];
-      } else {
-        buildingElements = generateProceduralBuildings(routeCenterLat, routeCenterLng);
+
+      if (!response.ok) {
+        throw new Error(`Overpass returned status ${response.status}`);
       }
+
+      overpassData = await response.json();
+      overpassCache.set(bboxKey, { timestamp: Date.now(), data: overpassData });
     }
-  } catch (e) {
-    buildingElements = generateProceduralBuildings(routeCenterLat, routeCenterLng);
-  }
-
-  // Process buildings footprint & pre-project shadow structures in meter coordinates
-  interface BuildingGeom {
-    id: number;
-    height: number;
-    name: string;
-    footprintMeters: { x: number; y: number }[];
-    footprintLatLng: [number, number][];
-    shadowPolygonsMeters: { x: number; y: number }[][]; // building + wall shadows
-    shadowPolygonsLatLng: [number, number][][];
-  }
-
-  const processedBuildings: BuildingGeom[] = [];
-
-  for (const element of buildingElements) {
-    if (!element.geometry || element.geometry.length < 3) continue;
-
-    const bName = element.tags?.name || '근처 빌딩';
-    const height = getBuildingHeight(element.tags);
-
-    // Convert coordinates to meters
-    const footprintMeters = element.geometry.map((pt: any) => latLngToMeters(pt.lat, pt.lon));
-    const footprintLatLng = element.geometry.map((pt: any) => [pt.lat, pt.lon] as [number, number]);
-
-    // Extrude shadows
-    const shadowPolygonsMeters: { x: number; y: number }[][] = [];
-    const shadowPolygonsLatLng: [number, number][][] = [];
-
-    if (solar.elevation > 0 && shadowLengthFactor > 0) {
-      const shadowDist = height * shadowLengthFactor;
-      const dx = shadowDist * Math.sin(shadowAngleRad);
-      const dy = shadowDist * Math.cos(shadowAngleRad);
-
-      // Create extrusion quads for each wall edge
-      for (let i = 0; i < footprintMeters.length - 1; i++) {
-        const p1 = footprintMeters[i];
-        const p2 = footprintMeters[i + 1];
-        const s1 = { x: p1.x + dx, y: p1.y + dy };
-        const s2 = { x: p2.x + dx, y: p2.y + dy };
-
-        const quadMeters = [p1, p2, s2, s1, p1];
-        shadowPolygonsMeters.push(quadMeters);
-
-        const quadLatLng = quadMeters.map(pt => {
-          const latlng = metersToLatLng(pt.x, pt.y);
-          return [latlng.lat, latlng.lng] as [number, number];
-        });
-        shadowPolygonsLatLng.push(quadLatLng);
-      }
-    }
-
-    processedBuildings.push({
-      id: element.id,
-      height,
-      name: bName,
-      footprintMeters,
-      footprintLatLng,
-      shadowPolygonsMeters,
-      shadowPolygonsLatLng
+  } catch (err: any) {
+    console.error('Overpass request failed:', err.message);
+    return res.status(502).json({
+      error: 'OVERPASS_UNAVAILABLE',
+      message: '실제 OSM 건물 데이터를 불러오지 못했습니다.',
+      buildingSource: 'none'
     });
   }
 
-  // 5. Sample routes and calculate shade percentages
+  if (!overpassData || !overpassData.elements || overpassData.elements.length === 0) {
+    return res.status(404).json({
+      error: 'NO_BUILDINGS_FOUND',
+      message: '선택한 경로 주변에서 OSM 건물 데이터를 찾지 못했습니다.',
+      buildingSource: 'overpass'
+    });
+  }
+
+  // 5. Convert Overpass elements to GeoJSON using osmtogeojson
+  let geojsonData: any;
+  try {
+    geojsonData = osmtogeojson(overpassData, { flatProperties: true });
+  } catch (err: any) {
+    console.error('osmtogeojson conversion failed:', err.message);
+    return res.status(500).json({ error: 'OSM 데이터 변환에 실패했습니다.' });
+  }
+
+  // Filter building and building:part features
+  const rawFeatures: any[] = [];
+  if (geojsonData && geojsonData.features) {
+    for (const f of geojsonData.features) {
+      if (f.geometry.type !== 'Polygon' && f.geometry.type !== 'MultiPolygon') continue;
+      const props = f.properties || {};
+      const isBuilding = !!props.building;
+      const isPart = !!props['building:part'];
+      if (!isBuilding && !isPart) continue;
+
+      const osmId = String(f.id);
+      const [osmType, osmIdNum] = osmId.split('/');
+      const hData = getBuildingHeight(props);
+
+      rawFeatures.push({
+        osmId: osmIdNum || osmId,
+        osmType: osmType === 'relation' ? 'relation' : 'way',
+        featureType: isPart ? 'building:part' : 'building',
+        geometry: f.geometry,
+        height: hData.height,
+        heightSource: hData.heightSource,
+        heightConfidence: hData.heightConfidence,
+        name: props.name || (isPart ? '건물 부분' : '근처 건물')
+      });
+    }
+  }
+
+  // Deduplicate: remove parents of building:parts to prevent shadow stacking
+  const parts = rawFeatures.filter(f => f.featureType === 'building:part');
+  const buildings = rawFeatures.filter(f => f.featureType === 'building');
+  
+  const filteredBuildings = buildings.filter(b => {
+    for (const p of parts) {
+      try {
+        const overlap = turf.booleanOverlap(b as any, p as any) ||
+                        turf.booleanContains(b as any, p as any) ||
+                        turf.booleanContains(p as any, b as any);
+        if (overlap) return false;
+      } catch (e) {
+        // Fallback bbox overlap
+        const bboxB = turf.bbox(b as any);
+        const bboxP = turf.bbox(p as any);
+        const bboxOverlap = !(bboxB[2] < bboxP[0] || bboxB[0] > bboxP[2] || bboxB[3] < bboxP[1] || bboxB[1] > bboxP[3]);
+        if (bboxOverlap) return false;
+      }
+    }
+    return true;
+  });
+
+  const finalBuildingFeatures = [...parts, ...filteredBuildings];
+
+  // 6. Proj4 UTM Setup for calculations in precise metric units
+  const utmProj = getUTMProjString(routeCenterLat, routeCenterLng);
+
+  // Pre-process buildings and extrude complete shadow polygons in UTM space
+  interface MetricBuilding {
+    osmId: string;
+    osmType: 'way' | 'relation';
+    featureType: 'building' | 'building:part';
+    height: number;
+    heightSource: string;
+    heightConfidence: string;
+    name: string;
+    footprintWGS84: any;
+    footprintUTM: any;
+    shadowWGS84: any;
+    shadowUTMUTM: any;
+    shadowBBoxUTM: number[]; // pre-calculated bbox in UTM space for fast filtering
+  }
+
+  const processedBuildings: MetricBuilding[] = [];
+
+  for (const b of finalBuildingFeatures) {
+    const footprintUTM = projectGeometryToUTM(b.geometry, utmProj);
+    let shadowUTM: any = null;
+    let shadowBBoxUTM: number[] = [];
+
+    if (solar.elevation > 0 && shadowLengthFactor > 0) {
+      const shadowDist = b.height * shadowLengthFactor;
+      // Direction of displacement (opposite to sun)
+      const dx = shadowDist * Math.sin(shadowBearing * (Math.PI / 180));
+      const dy = shadowDist * Math.cos(shadowBearing * (Math.PI / 180));
+
+      const translatedUTM = translatePolygonUTM(footprintUTM, dx, dy);
+      const sideQuads = createSidePolygonsUTM(footprintUTM, translatedUTM);
+      shadowUTM = unionShadowUTM(footprintUTM, translatedUTM, sideQuads);
+      shadowBBoxUTM = turf.bbox(turf.feature(shadowUTM));
+    }
+
+    processedBuildings.push({
+      osmId: b.osmId,
+      osmType: b.osmType,
+      featureType: b.featureType,
+      height: b.height,
+      heightSource: b.heightSource,
+      heightConfidence: b.heightConfidence,
+      name: b.name,
+      footprintWGS84: b.geometry,
+      footprintUTM,
+      shadowWGS84: shadowUTM ? projectGeometryToWGS84(shadowUTM, utmProj) : null,
+      shadowUTMUTM: shadowUTM,
+      shadowBBoxUTM
+    });
+  }
+
+  // 7. Route shadow intersection calculations using fast bounding box checks
   const finalRoutes = routesData.routes.map((route: any, index: number) => {
     const rawCoords = route.geometry.coordinates; // [lng, lat]
     const routeLatLng = rawCoords.map((c: number[]) => [c[1], c[0]] as [number, number]);
 
-    // Convert complete path to metric coordinates
-    const metricPath = routeLatLng.map(([lat, lng]: [number, number]) => latLngToMeters(lat, lng));
-    
-    // Sample path every 5 meters
-    const samplePoints = samplePathAtInterval(metricPath, 5);
+    // Project route coordinates to UTM meters
+    const routeUTMCoords = routeLatLng.map(([lat, lng]: [number, number]) => proj4(wgs84, utmProj, [lng, lat]) as [number, number]);
 
+    // Sample path every 5 meters
+    const samplesUTM = samplePathMeters(routeUTMCoords, 5);
     let shadedSamples = 0;
 
-    // Check each sample point against building footprints & shadow quads
-    for (const point of samplePoints) {
+    for (const [x, y] of samplesUTM) {
       let isShaded = false;
-      for (const building of processedBuildings) {
-        // 1. Is point inside the actual building footprint itself?
-        if (isPointInPolygon(point, building.footprintMeters)) {
+      
+      for (const b of processedBuildings) {
+        // Skip check if sun is below horizon
+        if (solar.elevation <= 0) {
           isShaded = true;
           break;
         }
-        // 2. Is point inside any shadow projection wall quad?
-        let insideQuad = false;
-        for (const quad of building.shadowPolygonsMeters) {
-          if (isPointInPolygon(point, quad)) {
-            insideQuad = true;
-            break;
+
+        if (!b.shadowUTMUTM) continue;
+
+        // BBox optimization check before calling expensive point-in-polygon
+        const [minX, minY, maxX, maxY] = b.shadowBBoxUTM;
+        if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+          try {
+            if (turf.booleanPointInPolygon(turf.point([x, y]), b.shadowUTMUTM)) {
+              isShaded = true;
+              break;
+            }
+          } catch (err) {
+            // Ignore error
           }
         }
-        if (insideQuad) {
-          isShaded = true;
-          break;
-        }
       }
+      
       if (isShaded) {
         shadedSamples++;
       }
     }
 
-    const totalSamples = samplePoints.length || 1;
+    const totalSamples = samplesUTM.length || 1;
     const shadeRatioFraction = shadedSamples / totalSamples;
     const shadeRatio = Math.round(shadeRatioFraction * 100);
 
-    const distance = route.distance; // in meters
-    const duration = Math.round(route.duration / 60) || 1; // in minutes
+    const distance = Math.round(route.distance);
+    const duration = Math.round(route.duration / 60) || 1;
 
     const shadeDistance = Math.round(distance * shadeRatioFraction);
     const exposedDistance = distance - shadeDistance;
 
-    // Heat penalty equation based on temperature
-    // Base temperature for penalty is 25°C. Sunny day UV penalty increases cost.
+    // Route Cost Scoring Equation
     const temperature = weatherCondition === 'sunny' ? 33 : weatherCondition === 'cloudy' ? 26 : 22;
     const baseHeatPenalty = Math.max(1.0, 1.0 + (temperature - 25) * 0.15);
-    
-    // User adjustable shade weight maps to a multiplier (0 to 2.5)
     const weightMultiplier = (shadeWeight / 50.0);
     const heatPenalty = baseHeatPenalty * weightMultiplier;
-
-    // Final multi-criteria routing cost equation: routeCost = distance + exposedDistance * heatPenalty
     const routeCost = Math.round(distance + exposedDistance * heatPenalty);
 
-    // Calories burned: ~4 kcal per minute of standard flat walking
     const calories = Math.round(duration * 4.2);
 
-    // Text instructions matching real landmarks
-    const isShadeRoute = index === 0;
-    const steps = [
-      '보행 신호를 대기하고 출발지에서 진입합니다.',
-      isShadeRoute 
-        ? '시원한 빌딩 그늘이 풍부하게 드리워진 이면도로를 경유합니다. (그늘 비율 높음)'
-        : '주변 빌딩의 높이가 낮아 일사에 노출되는 넓은 대성로를 따라 이동합니다.',
-      `${Math.round(distance / 2)}m 직진 후, 횡단보도를 건너 우회전합니다.`
-    ];
-
     return {
-      type: isShadeRoute ? 'shade' : 'shortest',
-      name: isShadeRoute ? '실시간 추천 그늘 우회길' : `최단 대안 경로 ${index}`,
+      type: 'shortest' as 'shade' | 'shortest',
+      name: `대안 경로 ${index + 1}`,
       coords: routeLatLng,
       distance,
       duration,
@@ -588,31 +737,69 @@ app.post('/api/shade-route', async (req, res) => {
       shadeDistance,
       routeCost,
       calories,
-      steps
+      steps: [
+        '출발지에서 도보 안전로를 이용해 출발합니다.',
+        `전체 경로의 약 ${shadeRatio}% 구간이 시원한 빌딩 그늘에 보행 통과됩니다.`,
+        `목적지 부근에 보행 통행을 거쳐 안전하게 진입합니다.`
+      ]
     };
   });
 
-  // Sort final candidate paths to place the best scoring (lowest routeCost) path first
-  finalRoutes.sort((a: any, b: any) => a.routeCost - b.routeCost);
-  
-  // Tag the absolute best as 'shade' and the second as 'shortest' to fit layout
-  if (finalRoutes[0]) finalRoutes[0].type = 'shade';
-  if (finalRoutes[1]) finalRoutes[1].type = 'shortest';
+  // Calculate recommendedShadeRoute and shortestRoute
+  let recommendedShadeRoute = finalRoutes[0];
+  let shortestRoute = finalRoutes[0];
+
+  for (const r of finalRoutes) {
+    if (r.routeCost < recommendedShadeRoute.routeCost) {
+      recommendedShadeRoute = r;
+    }
+    if (r.distance < shortestRoute.distance) {
+      shortestRoute = r;
+    }
+  }
+
+  // Update types
+  finalRoutes.forEach((r: any) => {
+    if (r === recommendedShadeRoute && r === shortestRoute) {
+      r.type = 'shade';
+      r.name = '추천 그늘길 & 최단 경로 🌲🥵';
+    } else if (r === recommendedShadeRoute) {
+      r.type = 'shade';
+      r.name = '실시간 추천 그늘 안전길 🌲';
+    } else if (r === shortestRoute) {
+      r.type = 'shortest';
+      r.name = '뙤약볕 최단 직선 경로 🥵';
+    }
+  });
+
+  // Count actually loaded buildings and projected shadows
+  const buildingCount = processedBuildings.length;
+  const shadowCount = processedBuildings.filter(b => b.shadowWGS84).length;
 
   return res.json({
     solar,
     routes: finalRoutes,
     buildings: processedBuildings.map(b => ({
-      id: b.id,
-      name: b.name,
+      osmId: b.osmId,
+      osmType: b.osmType,
+      featureType: b.featureType,
       height: b.height,
-      footprint: b.footprintLatLng,
-      shadows: b.shadowPolygonsLatLng
-    }))
+      heightSource: b.heightSource,
+      heightConfidence: b.heightConfidence,
+      name: b.name,
+      footprint: b.footprintWGS84?.coordinates?.[0]?.map((p: any) => [p[1], p[0]]) || [], // Convert [lng, lat] back to [lat, lng] for leaflet
+      shadows: b.shadowWGS84?.coordinates?.[0]?.map((p: any) => [p[1], p[0]]) ? [b.shadowWGS84.coordinates[0].map((p: any) => [p[1], p[0]])] : []
+    })),
+    routingSource,
+    buildingSource: "overpass",
+    buildingCount,
+    shadowCount,
+    degraded: routingSource !== "openrouteservice" || shadowCount === 0,
+    warnings
   });
 });
 
-// Setup Vite Dev Server / serve static dist in production
+// Setup dev and production servers
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

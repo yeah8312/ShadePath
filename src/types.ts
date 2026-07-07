@@ -9,34 +9,22 @@ export interface Coordinate {
 }
 
 export interface SolarPosition {
-  elevation: number; // in degrees (0 to 90, negative if night)
-  azimuth: number;   // in degrees (0 to 360, 0=North, 90=East, 180=South, 270=West)
-  shadowLengthRatio: number; // multiplier for shadow projection length
-}
-
-export interface GridCell {
-  x: number;
-  y: number;
-  lat: number;
-  lng: number;
-  buildingFactor: number; // 0 = no building, 1 = full building
-  walkable: boolean;      // true if roads or walkable paths
-  greeneryFactor: number; // 0 = no greenery, 1 = full tree cover
-  isShadowed: boolean;    // dynamically calculated based on solar calculations
-  shadowIntensity: number; // 0 to 1 shade coverage
-  shadeScore: number;     // calculated composite comfort score (0 to 100)
+  elevation: number; // in degrees
+  azimuth: number;   // in degrees (0=North, 90=East, 180=South, 270=West)
+  shadowLengthRatio: number;
 }
 
 export interface PathResult {
   type: 'shade' | 'shortest';
   name: string;
-  coords: [number, number][]; // lat, lng pairs
-  gridPath: GridCell[];
+  coords: [number, number][]; // [lat, lng] pairs
   distance: number; // meters
   duration: number; // minutes
   shadeRatio: number; // percentage (0 - 100)
+  exposedDistance: number; // meters
+  shadeDistance: number; // meters
   calories: number; // kcal
-  steps: string[]; // text guidance
+  steps: string[]; // text instructions
 }
 
 export type WeatherCondition = 'sunny' | 'cloudy' | 'rainy';
@@ -48,11 +36,27 @@ export interface WeatherState {
   uvIndex: number;
 }
 
-export interface Landmark {
+export interface LocationPreset {
   id: string;
   name: string;
   lat: number;
   lng: number;
   description: string;
-  gridTemplateType: 'dense' | 'park' | 'mixed'; // to generate different building layout styles for simulation
+}
+
+export interface ResolvedLocation {
+  name: string;
+  displayName: string;
+  lat: number;
+  lng: number;
+}
+
+export interface BuildingFeature {
+  osmId: string;
+  osmType: 'way' | 'relation';
+  featureType: 'building' | 'building:part';
+  geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon;
+  height: number;
+  heightSource: 'height' | 'est_height' | 'levels-estimate' | 'type-fallback';
+  heightConfidence: 'high' | 'medium' | 'low';
 }
