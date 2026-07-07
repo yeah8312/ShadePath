@@ -12,13 +12,15 @@ interface PathDetailsProps {
   shortestPath: PathResult | null;
   selectedPathType: 'shade' | 'shortest';
   setSelectedPathType: (type: 'shade' | 'shortest') => void;
+  endPointName?: string;
 }
 
 export default function PathDetails({
   shadePath,
   shortestPath,
   selectedPathType,
-  setSelectedPathType
+  setSelectedPathType,
+  endPointName = '목적지'
 }: PathDetailsProps) {
   const [showSteps, setShowSteps] = useState(true);
 
@@ -182,7 +184,9 @@ export default function PathDetails({
                         ? 'font-semibold text-emerald-800'
                         : 'text-gray-600'
                     }`}>
-                      {step}
+                      {isLast 
+                        ? `${endPointName}(으)로 안전하게 도착합니다! (${selectedPathType === 'shade' ? '시원하고 안전함 🌲' : '더위 노출 유의 🥵'})`
+                        : step}
                     </span>
                   </div>
                 </div>
