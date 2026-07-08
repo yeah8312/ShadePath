@@ -6,7 +6,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Sun, Cloud, CloudRain, Navigation, Compass, Footprints, Info, MapPin, 
-  ArrowUpDown, Layers, Sliders, Clock, ChevronDown, Activity, Settings, Search, Check, AlertCircle
+  ArrowUpDown, Layers, Clock, ChevronDown, Activity, Settings, Search, Check, AlertCircle
 } from 'lucide-react';
 import { LocationPreset, WeatherCondition, WeatherState, PathResult, SolarPosition, ResolvedLocation } from './types';
 import MapContainer from './components/MapContainer';
@@ -56,7 +56,6 @@ export default function App() {
   const [weatherCondition, setWeatherCondition] = useState<WeatherCondition>('sunny');
   const [timeOffsetHours, setTimeOffsetHours] = useState<number>(0);
   const [selectedPathType, setSelectedPathType] = useState<'shade' | 'shortest'>('shade');
-  const [shadeWeight, setShadeWeight] = useState<number>(50); // 0 to 100
 
   // --- Layer Visibility Options ---
   const [showShadows, setShowShadows] = useState<boolean>(true);
@@ -125,12 +124,15 @@ export default function App() {
 
   // --- Sync coordinates when preset changes ---
   useEffect(() => {
-    setRealStart([currentPreset.lat, currentPreset.lng]);
-    setRealEnd([currentPreset.lat + 0.0012, currentPreset.lng + 0.0016]);
+    const presetStart = currentPreset.start ?? { lat: currentPreset.lat, lng: currentPreset.lng };
+    const presetEnd = currentPreset.end ?? { lat: currentPreset.lat + 0.0012, lng: currentPreset.lng + 0.0016 };
+
+    setRealStart([presetStart.lat, presetStart.lng]);
+    setRealEnd([presetEnd.lat, presetEnd.lng]);
     setMapCenter([currentPreset.lat, currentPreset.lng]);
-    setStartSearchQuery(currentPreset.name);
-    setEndPointName('프리셋 지정 목적지');
-    setEndSearchQuery('프리셋 지정 목적지');
+    setStartSearchQuery(currentPreset.startName ?? currentPreset.name);
+    setEndPointName(currentPreset.endName ?? '프리셋 지정 목적지');
+    setEndSearchQuery(currentPreset.endName ?? '프리셋 지정 목적지');
   }, [currentPreset]);
 
   // --- Geocoding Query Functions ---
@@ -226,8 +228,7 @@ export default function App() {
           start: { lat: realStart[0], lng: realStart[1] },
           end: { lat: realEnd[0], lng: realEnd[1] },
           datetime: simTime.toISOString(),
-          weatherCondition,
-          shadeWeight
+          weatherCondition
         }),
         signal: controller.signal
       });
@@ -243,8 +244,15 @@ export default function App() {
       setDegraded(!!data.degraded);
       setApiWarnings(data.warnings || []);
 
-      const shade = data.routes?.find((r: any) => r.type === 'shade') || data.routes?.[0] || null;
-      const shortest = data.routes?.find((r: any) => r.type === 'shortest') || data.routes?.[1] || null;
+      const routes = data.routes || [];
+      const shade = routes.reduce((best: any | null, route: any) => {
+        if (!best) return route;
+        return route.routeCost < best.routeCost ? route : best;
+      }, null);
+      const shortest = routes.reduce((best: any | null, route: any) => {
+        if (!best) return route;
+        return route.distance < best.distance ? route : best;
+      }, null);
 
       setRealShadePath(shade);
       setRealShortestPath(shortest);
@@ -595,30 +603,6 @@ export default function App() {
               baseTime={baseTime}
               onResetTime={() => setTimeOffsetHours(0)}
             />
-
-            {/* Interactive Weight Preferences slider */}
-            <div className="bg-slate-50 p-4 rounded-2xl border border-slate-150 flex flex-col gap-2">
-              <div className="flex justify-between items-center text-[10px] text-slate-500 font-bold uppercase">
-                <span>그늘 가중치 우선도</span>
-                <span className="text-emerald-700 font-extrabold">
-                  {shadeWeight === 50 ? '균형 지점' : shadeWeight > 50 ? '그늘막 우선' : '최단거리 우선'}
-                </span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="5"
-                value={shadeWeight}
-                onChange={(e) => setShadeWeight(parseInt(e.target.value))}
-                className="w-full accent-emerald-600 h-1 bg-slate-200 rounded-lg cursor-pointer mt-1"
-              />
-              <div className="flex justify-between text-[8px] text-slate-400 font-semibold font-mono">
-                <span>⚡ 최단 직선 우선</span>
-                <span>{shadeWeight}% 가중</span>
-                <span>🌲 시원한 그늘 우선</span>
-              </div>
-            </div>
 
             {/* Path details comparisons & step descriptions */}
             <div className="border-t border-slate-150 pt-3">

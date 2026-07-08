@@ -16,6 +16,17 @@ export const LOCATION_PRESETS: LocationPreset[] = [
     description: '대구 도심의 밀집 건물 지대 (실제 빌딩 그늘 분석 최적)'
   },
   {
+    id: 'yu-subway-to-it',
+    name: '영남대역 출구 → 영남대 IT관',
+    lat: 35.8341,
+    lng: 128.7561,
+    description: '영남대역 출구에서 영남대 IT관까지 캠퍼스 보행 경로',
+    start: { lat: 35.83658, lng: 128.75355 },
+    end: { lat: 35.83062, lng: 128.75434 },
+    startName: '영남대 지하철 출구',
+    endName: '영남대 IT관'
+  },
+  {
     id: 'gukchaebosang-park',
     name: '대구 국채보상운동기념공원',
     lat: 35.8698,
