@@ -81,15 +81,15 @@ function parseBuildingHeight(tags: any): {
 // 2. Solar Positioning
 function getSolarAngles(date: Date, lat: number, lng: number) {
   const position = SunCalc.getPosition(date, lat, lng);
-  const elevationDeg = position.altitude * (180 / Math.PI);
-  const azimuthDeg = (position.azimuth * (180 / Math.PI) + 180) % 360;
+  const elevationDeg = position.altitude;
+  const azimuthDeg = position.azimuth;
 
   let shadowLengthRatio = 0;
-  if (position.altitude > 0) {
+  if (elevationDeg > 0) {
     if (elevationDeg < 3) {
       shadowLengthRatio = 8.0;
     } else {
-      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(position.altitude));
+      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(elevationDeg * Math.PI / 180));
     }
   }
 
@@ -180,15 +180,17 @@ function unionShadowUTM(footprint: any, translated: any, sideQuads: any[]): any 
 }
 
 // 7. Route Cost score calculator
-function getRouteCost(distance: number, shadeRatio: number, shadeWeight: number, weatherCondition: string): number {
+function getRouteCost(distance: number, shadeRatio: number, weatherCondition: string): number {
   const shadeRatioFraction = shadeRatio / 100;
   const shadeDistance = Math.round(distance * shadeRatioFraction);
   const exposedDistance = distance - shadeDistance;
 
-  const temperature = weatherCondition === 'sunny' ? 33 : weatherCondition === 'cloudy' ? 26 : 22;
-  const baseHeatPenalty = Math.max(1.0, 1.0 + (temperature - 25) * 0.15);
-  const weightMultiplier = (shadeWeight / 50.0);
-  const heatPenalty = baseHeatPenalty * weightMultiplier;
+  const heatPenaltyByWeather: Record<string, number> = {
+    sunny: 3.6,
+    cloudy: 1.2,
+    rainy: 0.05
+  };
+  const heatPenalty = heatPenaltyByWeather[weatherCondition] ?? heatPenaltyByWeather.sunny;
 
   return Math.round(distance + exposedDistance * heatPenalty);
 }
@@ -387,19 +389,22 @@ function testRouteCostScoring() {
 
   const dist = 1000; // 1km
 
-  // 1) Shaded route: 90% shade, sunny weather, weight 50%
-  const costShaded = getRouteCost(dist, 90, 50, 'sunny');
+  // 1) Shaded route: 90% shade, sunny weather
+  const costShaded = getRouteCost(dist, 90, 'sunny');
   
-  // 2) Sunny route: 10% shade, sunny weather, weight 50%
-  const costSunny = getRouteCost(dist, 10, 50, 'sunny');
+  // 2) Sunny route: 10% shade, sunny weather
+  const costSunny = getRouteCost(dist, 10, 'sunny');
 
   // Exposed route should be significantly more costly than the shaded route
   assert.ok(costSunny > costShaded, `Sunny cost (${costSunny}) should be greater than shaded (${costShaded})`);
 
-  // 3) Sunny route in cloudy weather (no solar penalty)
-  const costCloudy = getRouteCost(dist, 10, 50, 'cloudy');
-  // Cloudy route cost should be lower than sunny route cost due to lower temperature
+  // 3) Sunny route in cloudy weather has a moderate penalty
+  const costCloudy = getRouteCost(dist, 10, 'cloudy');
   assert.ok(costSunny > costCloudy);
+
+  // 4) Rainy weather nearly ignores shade preference
+  const costRainy = getRouteCost(dist, 10, 'rainy');
+  assert.ok(costCloudy > costRainy);
 
   console.log('   ✅ Passed Route scoring and weight math!');
 }

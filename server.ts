@@ -261,6 +261,7 @@ async function fetchFromOverpassWithRetry(query: string, bbox: string): Promise<
     process.env.OVERPASS_API_URL,
     'https://overpass-api.de/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter',
   ].filter(Boolean))) as string[];
 
   const attempts: OverpassAttempt[] = [];
@@ -268,7 +269,7 @@ async function fetchFromOverpassWithRetry(query: string, bbox: string): Promise<
   for (const endpoint of OVERPASS_ENDPOINTS) {
     const startTime = Date.now();
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000);
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
 
     try {
       const response = await fetch(endpoint, {
@@ -363,31 +364,91 @@ async function fetchOrsRoutesRaw(start: { lat: number; lng: number }, end: { lat
     }
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Accept': 'application/json, application/geo+json',
-      'Authorization': ORS_API_KEY
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 18000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Accept': 'application/json, application/geo+json',
+          'Authorization': ORS_API_KEY
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.status === 429) {
+        throw new Error('RATE_LIMIT_EXCEEDED');
+      }
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`ORS_CALL_FAILED: ${response.status} - ${errText}`);
+      }
+
+      const data = await response.json();
+      if (!data || !data.features || data.features.length === 0) {
+        throw new Error('ROUTE_NOT_FOUND');
+      }
+
+      return data;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (lastError.message === 'RATE_LIMIT_EXCEEDED' || attempt === 2) {
+        break;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 800));
+    }
+  }
+
+  throw lastError || new Error('ORS_CALL_FAILED');
+}
+
+const YEUNGNAM_PRESET_ROUTE_CACHE = {
+  start: { lat: 35.83658, lng: 128.75355 },
+  end: { lat: 35.83062, lng: 128.75434 },
+  routes: [
+    {
+      distance: 771,
+      duration: 540,
+      geometry: {
+        type: 'LineString',
+        coordinates: [[128.753604,35.836621],[128.753679,35.836556],[128.753762,35.836483],[128.753493,35.836272],[128.753079,35.836083],[128.753053,35.835994],[128.752881,35.83595],[128.7534,35.834481],[128.753413,35.834443],[128.753867,35.833057],[128.753883,35.833011],[128.753971,35.832756],[128.75404,35.832546],[128.754095,35.832453],[128.754268,35.832157],[128.754472,35.831922],[128.754505,35.831773],[128.754428,35.831663],[128.754237,35.831603],[128.754249,35.831513],[128.754262,35.831423],[128.754472,35.83142],[128.754441,35.830851],[128.754476,35.830827],[128.754446,35.830666]]
+      }
     },
-    body: JSON.stringify(body)
-  });
+    {
+      distance: 1053,
+      duration: 780,
+      geometry: {
+        type: 'LineString',
+        coordinates: [[128.753604,35.836621],[128.753679,35.836556],[128.753762,35.836483],[128.753845,35.836549],[128.75394,35.836453],[128.754074,35.836555],[128.754296,35.836379],[128.755051,35.836549],[128.755204,35.836537],[128.755253,35.836472],[128.755675,35.835292],[128.755775,35.835019],[128.755801,35.834871],[128.755837,35.834845],[128.755875,35.834727],[128.755881,35.834662],[128.754406,35.83465],[128.754299,35.834629],[128.75418,35.834498],[128.75418,35.834394],[128.754336,35.833972],[128.754387,35.833915],[128.754406,35.833795],[128.754422,35.833744],[128.754755,35.832757],[128.754889,35.832509],[128.755021,35.832343],[128.755165,35.832209],[128.754947,35.83207],[128.755061,35.831808],[128.755216,35.831566],[128.755059,35.831371],[128.755131,35.831356],[128.755114,35.831207],[128.754602,35.830851],[128.754523,35.830848],[128.754476,35.830827],[128.754446,35.830666]]
+      }
+    }
+  ]
+};
 
-  if (response.status === 429) {
-    throw new Error('RATE_LIMIT_EXCEEDED');
-  }
+function getPresetRouteCache(start: { lat: number; lng: number }, end: { lat: number; lng: number }) {
+  const distanceMeters = (a: { lat: number; lng: number }, b: { lat: number; lng: number }) => turf.distance(
+    turf.point([a.lng, a.lat]),
+    turf.point([b.lng, b.lat]),
+    { units: 'kilometers' }
+  ) * 1000;
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`ORS_CALL_FAILED: ${response.status} - ${errText}`);
-  }
+  const startMatches = distanceMeters(start, YEUNGNAM_PRESET_ROUTE_CACHE.start) <= 40;
+  const endMatches = distanceMeters(end, YEUNGNAM_PRESET_ROUTE_CACHE.end) <= 40;
 
-  const data = await response.json();
-  if (!data || !data.features || data.features.length === 0) {
-    throw new Error('ROUTE_NOT_FOUND');
-  }
-
-  return data;
+  if (!startMatches || !endMatches) return null;
+  return YEUNGNAM_PRESET_ROUTE_CACHE.routes;
 }
 
 // --- Geocoding API Endpoints ---
@@ -479,7 +540,7 @@ app.get('/api/reverse-geocode', asyncHandler(async (req, res) => {
 
 // --- Main Pedestrian Shade Route Endpoint ---
 app.post('/api/shade-route', asyncHandler(async (req, res) => {
-  const { start, end, datetime, weatherCondition = 'sunny', shadeWeight = 50 } = req.body;
+  const { start, end, datetime, weatherCondition = 'sunny' } = req.body;
 
   if (!start || typeof start.lat !== 'number' || typeof start.lng !== 'number' ||
       !end || typeof end.lat !== 'number' || typeof end.lng !== 'number') {
@@ -501,18 +562,16 @@ app.post('/api/shade-route', asyncHandler(async (req, res) => {
 
   // 1. Calculate Solar Coordinates using suncalc
   const position = SunCalc.getPosition(targetTime, routeCenterLat, routeCenterLng);
-  const elevationDeg = position.altitude * (180 / Math.PI);
-  
-  // Convert SunCalc azimuth (South is 0, clockwise positive) to standard 0-360 (North is 0, clockwise positive)
-  const azimuthDeg = (position.azimuth * (180 / Math.PI) + 180) % 360;
+  const elevationDeg = position.altitude;
+  const azimuthDeg = position.azimuth;
 
   // Shadow length ratio = 1 / tan(elevation)
   let shadowLengthRatio = 0;
-  if (position.altitude > 0) {
+  if (elevationDeg > 0) {
     if (elevationDeg < 3) {
       shadowLengthRatio = 8.0;
     } else {
-      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(position.altitude));
+      shadowLengthRatio = Math.min(8.0, 1 / Math.tan(elevationDeg * Math.PI / 180));
     }
   }
 
@@ -522,8 +581,7 @@ app.post('/api/shade-route', asyncHandler(async (req, res) => {
     shadowLengthRatio
   };
 
-  const isCloudyOrRainy = weatherCondition === 'cloudy' || weatherCondition === 'rainy';
-  const shadowLengthFactor = isCloudyOrRainy ? 0 : solar.shadowLengthRatio;
+  const shadowLengthFactor = weatherCondition === 'rainy' ? 0 : solar.shadowLengthRatio;
   const shadowBearing = (solar.azimuth + 180) % 360;
 
   // 2. Request walking routes (prefer ORS, fallback to OSRM)
@@ -543,7 +601,14 @@ app.post('/api/shade-route', asyncHandler(async (req, res) => {
       };
     } catch (err: any) {
       console.warn('OpenRouteService routing failed, falling back to OSRM:', err.message);
-      warnings.push(`OpenRouteService 라우팅 오류로 OSRM 폴백 사용: ${err.message}`);
+      const presetRoutes = getPresetRouteCache(start, end);
+      if (presetRoutes) {
+        routingSource = "preset-cache";
+        routesData = { routes: presetRoutes };
+        warnings.push(`OpenRouteService 라우팅 오류로 영남대 프리셋 캐시 사용: ${err.message}`);
+      } else {
+        warnings.push(`OpenRouteService 라우팅 오류로 OSRM 폴백 사용: ${err.message}`);
+      }
     }
   } else {
     warnings.push("ORS_API_KEY가 비어 있어 기본 OSRM 라우터를 사용합니다.");
@@ -571,6 +636,31 @@ app.post('/api/shade-route', asyncHandler(async (req, res) => {
     } catch (err: any) {
       console.error('OSRM route failed:', err.message);
       return res.status(502).json({ error: '보행 경로 데이터를 불러오는 데 실패했습니다.' });
+    }
+  }
+
+  if (routingSource === "osrm") {
+    const straightLineDistance = turf.distance(
+      turf.point([start.lng, start.lat]),
+      turf.point([end.lng, end.lat]),
+      { units: 'kilometers' }
+    ) * 1000;
+    const maxFallbackDistance = Math.max(straightLineDistance * 2.2, straightLineDistance + 600);
+    const viableRoutes = routesData.routes.filter((route: any) => Number(route.distance) <= maxFallbackDistance);
+
+    if (viableRoutes.length === 0) {
+      return res.status(502).json({
+        error: 'OSRM 폴백 경로가 출발지와 도착지를 과도하게 우회하여 사용하지 않았습니다. OpenRouteService 연결을 다시 시도해 주세요.',
+        routingSource,
+        directDistance: Math.round(straightLineDistance),
+        maxAcceptedDistance: Math.round(maxFallbackDistance),
+        warnings
+      });
+    }
+
+    if (viableRoutes.length < routesData.routes.length) {
+      warnings.push(`OSRM 폴백 경로 중 과도한 우회 후보 ${routesData.routes.length - viableRoutes.length}개를 제외했습니다.`);
+      routesData.routes = viableRoutes;
     }
   }
 
@@ -823,11 +913,12 @@ app.post('/api/shade-route', asyncHandler(async (req, res) => {
     const shadeDistance = Math.round(distance * shadeRatioFraction);
     const exposedDistance = distance - shadeDistance;
 
-    // Route Cost Scoring Equation
-    const temperature = weatherCondition === 'sunny' ? 33 : weatherCondition === 'cloudy' ? 26 : 22;
-    const baseHeatPenalty = Math.max(1.0, 1.0 + (temperature - 25) * 0.15);
-    const weightMultiplier = (shadeWeight / 50.0);
-    const heatPenalty = baseHeatPenalty * weightMultiplier;
+    const heatPenaltyByWeather: Record<string, number> = {
+      sunny: 3.6,
+      cloudy: 1.2,
+      rainy: 0.05
+    };
+    const heatPenalty = heatPenaltyByWeather[weatherCondition] ?? heatPenaltyByWeather.sunny;
     const routeCost = Math.round(distance + exposedDistance * heatPenalty);
 
     const calories = Math.round(duration * 4.2);
@@ -911,6 +1002,7 @@ app.get('/api/health', (req, res) => {
     process.env.OVERPASS_API_URL,
     'https://overpass-api.de/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter',
   ].filter(Boolean))) as string[];
 
   res.json({

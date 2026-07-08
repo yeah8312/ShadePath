@@ -42,6 +42,10 @@ export interface LocationPreset {
   lat: number;
   lng: number;
   description: string;
+  start?: Coordinate;
+  end?: Coordinate;
+  startName?: string;
+  endName?: string;
 }
 
 export interface ResolvedLocation {
